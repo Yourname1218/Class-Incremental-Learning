@@ -11,6 +11,8 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.backends import cudnn
 from torch.autograd import Variable
 import models
+from torch.serialization import add_safe_globals
+from models.resnet import ResNet_ImageNet, ResNet_Cifar, Generator, Discriminator, BasicBlock, Bottleneck
 
 from utils import RandomIdentitySampler, mkdir_if_missing, logging, display,truncated_z_sample
 from torch.optim.lr_scheduler import StepLR
@@ -30,6 +32,8 @@ import math
 import shutil
 import json
 
+# 將需要的類添加到安全列表中
+add_safe_globals([ResNet_ImageNet, ResNet_Cifar, Generator, Discriminator, BasicBlock, Bottleneck, ClassifierMLP, ModelCNN])
 
 cudnn.benchmark = True
 from copy import deepcopy
@@ -257,12 +261,15 @@ def train_task(args, train_loader, current_task, prototype={}, pre_index=0):
     sys.stdout = logging.Logger(os.path.join(log_dir, 'log_task{}.txt'.format(current_task)))
     tb_writer = SummaryWriter(log_dir)
     display(args)
+    
+    # 確保所有需要的類都已經被註冊為安全
+    add_safe_globals([ResNet_ImageNet, ResNet_Cifar, Generator, Discriminator, BasicBlock, Bottleneck, ClassifierMLP, ModelCNN])
+    
     # One-hot encoding or attribute encoding
     if 'imagenet' in args.data or 'medicine' in args.data:
-        model = models.create('resnet18_imagenet', pretrained=False, feat_dim=args.feat_dim,embed_dim=args.num_class)
+        model = models.create('resnet50_imagenet', pretrained=False, feat_dim=2048, embed_dim=args.num_class)
     elif 'cifar' in args.data:
-        model = models.create('resnet18_cifar', pretrained=False, feat_dim=args.feat_dim,embed_dim=args.num_class)
-
+        model = models.create('resnet50_cifar', pretrained=False, feat_dim=2048, embed_dim=args.num_class)
 
     if current_task > 0:
         try:
@@ -276,17 +283,41 @@ def train_task(args, train_loader, current_task, prototype={}, pre_index=0):
             print(f"Generator: {generator_path}")
             print(f"Discriminator: {discriminator_path}")
             
-            # 直接加載整個模型
-            model = torch.load(model_path)
+            def safe_load(path, desc):
+                """安全地加載模型，包含多種嘗試策略"""
+                try:
+                    print(f"嘗試加載 {desc}，使用 weights_only=False")
+                    return torch.load(path, weights_only=False)
+                except Exception as e1:
+                    print(f"使用 weights_only=False 加載 {desc} 失敗: {e1}")
+                    try:
+                        print(f"嘗試加載 {desc}，使用 pickle.load")
+                        import pickle
+                        with open(path, 'rb') as f:
+                            return pickle.load(f)
+                    except Exception as e2:
+                        print(f"使用 pickle.load 加載 {desc} 失敗: {e2}")
+                        try:
+                            print(f"最後嘗試使用 torch.load 搭配 map_location='cpu'")
+                            return torch.load(path, weights_only=False, map_location='cpu')
+                        except Exception as e3:
+                            print(f"所有加載方法都失敗: {e3}")
+                            raise RuntimeError(f"無法加載 {desc}")
+            
+            # 嘗試安全加載主模型
+            print("加載主模型...")
+            model = safe_load(model_path, "主模型")
             model = model.cuda()
             
             model_old = deepcopy(model)
             model_old.eval()
             model_old = freeze_model(model_old)
             
-            # 加載生成器和判別器
-            generator = torch.load(generator_path)
-            discriminator = torch.load(discriminator_path)
+            # 嘗試安全加載生成器和判別器
+            print("加載生成器...")
+            generator = safe_load(generator_path, "生成器")
+            print("加載判別器...")
+            discriminator = safe_load(discriminator_path, "判別器")
             
             generator = generator.cuda()
             discriminator = discriminator.cuda()
@@ -299,16 +330,17 @@ def train_task(args, train_loader, current_task, prototype={}, pre_index=0):
         except Exception as e:
             print(f"Error loading models: {e}")
             raise
+
     else:
         # 第一個任務的初始化
         if 'imagenet' in args.data or 'medicine' in args.data:
-            model = models.create('resnet18_imagenet', pretrained=False, feat_dim=args.feat_dim,embed_dim=args.num_class)
+            model = models.create('resnet50_imagenet', pretrained=False, feat_dim=2048, embed_dim=args.num_class)
         elif 'cifar' in args.data:
-            model = models.create('resnet18_cifar', pretrained=False, feat_dim=args.feat_dim,embed_dim=args.num_class)
+            model = models.create('resnet50_cifar', pretrained=False, feat_dim=2048, embed_dim=args.num_class)
         model = model.cuda()
         
-        generator = Generator(feat_dim=args.feat_dim,latent_dim=args.latent_dim, hidden_dim=args.hidden_dim, class_dim=args.num_class).cuda()
-        discriminator = Discriminator(feat_dim=args.feat_dim,hidden_dim=args.hidden_dim, class_dim=args.num_class).cuda()
+        generator = Generator(feat_dim=2048, latent_dim=args.latent_dim, hidden_dim=args.hidden_dim, class_dim=args.num_class).cuda()
+        discriminator = Discriminator(feat_dim=2048, hidden_dim=args.hidden_dim, class_dim=args.num_class).cuda()
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = StepLR(optimizer, step_size=args.lr_decay_step, gamma=args.lr_decay)
@@ -320,14 +352,54 @@ def train_task(args, train_loader, current_task, prototype={}, pre_index=0):
     lambda_lwf = args.gan_tradeoff
     # Initialize generator and discriminator
     if current_task == 0:
-        generator = Generator(feat_dim=args.feat_dim,latent_dim=args.latent_dim, hidden_dim=args.hidden_dim, class_dim=args.num_class)
-        discriminator = Discriminator(feat_dim=args.feat_dim,hidden_dim=args.hidden_dim, class_dim=args.num_class)
+        generator = Generator(feat_dim=2048, latent_dim=args.latent_dim, hidden_dim=args.hidden_dim, class_dim=args.num_class)
+        discriminator = Discriminator(feat_dim=2048, hidden_dim=args.hidden_dim, class_dim=args.num_class)
     else:
-        generator = torch.load(os.path.join(log_dir, 'task_' + str(current_task - 1).zfill(2) + '_%d_model_generator.pkl' % int(args.epochs_gan - 1)))
-        discriminator = torch.load(os.path.join(log_dir, 'task_' + str(current_task - 1).zfill(2) + '_%d_model_discriminator.pkl' % int(args.epochs_gan - 1)))
-        generator_old = deepcopy(generator)
-        generator_old.eval()
-        generator_old = freeze_model(generator_old)
+        try:
+            generator_path = os.path.join(log_dir, 'task_' + str(current_task - 1).zfill(2) + '_%d_model_generator.pkl' % int(args.epochs_gan - 1))
+            discriminator_path = os.path.join(log_dir, 'task_' + str(current_task - 1).zfill(2) + '_%d_model_discriminator.pkl' % int(args.epochs_gan - 1))
+            
+            print(f"Loading generator from: {generator_path}")
+            print(f"Loading discriminator from: {discriminator_path}")
+            
+            def safe_load(path, desc):
+                """安全地加載模型，包含多種嘗試策略"""
+                try:
+                    print(f"嘗試加載 {desc}，使用 weights_only=False")
+                    return torch.load(path, weights_only=False)
+                except Exception as e1:
+                    print(f"使用 weights_only=False 加載 {desc} 失敗: {e1}")
+                    try:
+                        print(f"嘗試加載 {desc}，使用 pickle.load")
+                        import pickle
+                        with open(path, 'rb') as f:
+                            return pickle.load(f)
+                    except Exception as e2:
+                        print(f"使用 pickle.load 加載 {desc} 失敗: {e2}")
+                        try:
+                            print(f"最後嘗試使用 torch.load 搭配 map_location='cpu'")
+                            return torch.load(path, weights_only=False, map_location='cpu')
+                        except Exception as e3:
+                            print(f"所有加載方法都失敗: {e3}")
+                            raise RuntimeError(f"無法加載 {desc}")
+            
+            # 嘗試安全加載生成器和判別器
+            print("加載生成器...")
+            generator = safe_load(generator_path, "生成器")
+            print("加載判別器...")
+            discriminator = safe_load(discriminator_path, "判別器")
+            
+            generator_old = deepcopy(generator)
+            generator_old.eval()
+            generator_old = freeze_model(generator_old)
+        except Exception as e:
+            print(f"錯誤: 無法加載生成器或判別器: {e}")
+            print("將重新初始化生成器和判別器")
+            generator = Generator(feat_dim=2048, latent_dim=args.latent_dim, hidden_dim=args.hidden_dim, class_dim=args.num_class)
+            discriminator = Discriminator(feat_dim=2048, hidden_dim=args.hidden_dim, class_dim=args.num_class)
+            generator_old = deepcopy(generator)
+            generator_old.eval()
+            generator_old = freeze_model(generator_old)
 
     generator = generator.cuda()
     discriminator = discriminator.cuda()
@@ -530,7 +602,8 @@ def train_task(args, train_loader, current_task, prototype={}, pre_index=0):
 
         if epoch == args.epochs-1:
             model_save_path = os.path.join(log_dir, f'task_{str(current_task).zfill(2)}_{epoch}_model.pkl')
-            torch.save(model, model_save_path)
+            # 使用 _use_new_zipfile_serialization=False 以確保兼容性
+            torch.save(model, model_save_path, _use_new_zipfile_serialization=False)
             print(f"Saved model to: {model_save_path}")
 
         # 收集數據
@@ -719,8 +792,9 @@ def train_task(args, train_loader, current_task, prototype={}, pre_index=0):
                 generator_save_path = os.path.join(log_dir, f'task_{str(current_task).zfill(2)}_{epoch}_model_generator.pkl')
                 discriminator_save_path = os.path.join(log_dir, f'task_{str(current_task).zfill(2)}_{epoch}_model_discriminator.pkl')
                 
-                torch.save(generator, generator_save_path)
-                torch.save(discriminator, discriminator_save_path)
+                # 使用 _use_new_zipfile_serialization=False 以確保兼容性
+                torch.save(generator, generator_save_path, _use_new_zipfile_serialization=False)
+                torch.save(discriminator, discriminator_save_path, _use_new_zipfile_serialization=False)
                 
                 print(f"Saved generator to: {generator_save_path}")
                 print(f"Saved discriminator to: {discriminator_save_path}")
@@ -1074,6 +1148,24 @@ def restore_project(backup_dir, target_dir=None):
         print(f"\n恢復過程中發生錯誤: {str(e)}")
         raise
 
+def load_model_safely(model_path):
+    """安全地加載模型，處理 PyTorch 2.6+ 的安全限制"""
+    try:
+        model = torch.load(model_path, weights_only=False)
+        return model
+    except Exception as e:
+        print(f"錯誤: 無法加載模型 {model_path}: {e}")
+        # 嘗試備選方案
+        try:
+            print("嘗試使用備選加載方法...")
+            # 設置 safe_globals 上下文管理器
+            with torch.serialization.safe_globals([ResNet_ImageNet, ResNet_Cifar, Generator, Discriminator, BasicBlock, Bottleneck, ClassifierMLP, ModelCNN]):
+                model = torch.load(model_path, weights_only=True)
+            return model
+        except Exception as e2:
+            print(f"備選加載方法也失敗: {e2}")
+            raise
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Generative Feature Replay Training')
 
@@ -1112,7 +1204,7 @@ if __name__ == '__main__':
     parser.add_argument('-n_critic', type=int, default=3)
 
     parser.add_argument('-latent_dim', type=int, default=200, help="learning rate of new parameters")
-    parser.add_argument('-feat_dim', type=int, default=512, help="learning rate of new parameters")
+    parser.add_argument('-feat_dim', type=int, default=2048, help="learning rate of new parameters")
     parser.add_argument('-hidden_dim', type=int, default=512, help="learning rate of new parameters")
     
     # training parameters
