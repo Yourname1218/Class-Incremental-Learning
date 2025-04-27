@@ -100,12 +100,16 @@ add_safe_globals([ResNet_Cifar, ResNet_ImageNet, BasicBlock, Bottleneck])
 
 def load_model_safely(model_path):
     try:
-        # 首先嘗試使用 weights_only=True
-        model = torch.load(model_path, weights_only=True)
+        # 直接使用 weights_only=False 加載模型
+        model = torch.load(model_path, weights_only=False)
     except Exception as e:
-        print(f"Warning: Failed to load with weights_only=True, falling back to full load: {e}")
-        # 如果失敗，回退到完整加載
-        model = torch.load(model_path)
+        print(f"Error loading model with weights_only=False: {e}")
+        try:
+            # 如果失敗，嘗試其它方法
+            model = torch.load(model_path, map_location='cpu', weights_only=False)
+        except Exception as e2:
+            print(f"All loading methods failed: {e2}")
+            raise
     return model
 
 def test_task(args, test_loader, current_task, model):
