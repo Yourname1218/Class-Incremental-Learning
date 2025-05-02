@@ -120,24 +120,17 @@ class StackingMetaModel(nn.Module):
         # 每個模型對每個類別的權重
         self.weights = nn.Parameter(torch.ones(num_models, num_classes))
         
-        # 溫度參數控制權重分佈的軟硬程度
-        self.temperature = nn.Parameter(torch.tensor(2.0))
-        
-        # 前500類與後500類的整體權重平衡參數
-        self.front_weight = nn.Parameter(torch.tensor(1.0))  # 前500類權重
-        self.back_weight = nn.Parameter(torch.tensor(1.0))   # 後500類權重
-        
         # 初始化權重，讓第0個模型在前500類有較高權重，其他模型在各自範圍有較高權重
         with torch.no_grad():
-            # 第0個模型在前500類有較高權重
-            self.weights[0, :500] = 2.0
+            # 第0個模型在前500類有適中權重
+            self.weights[0, :500] = 1.5
             
-            # 其他模型各自負責約50個類別
+            # 其他模型各自負責後500類的特定區域，但給予更高的初始權重
             classes_per_task = 50
             for i in range(1, num_models):
                 start_idx = 500 + (i-1) * classes_per_task
                 end_idx = min(500 + i * classes_per_task, num_classes)
-                self.weights[i, start_idx:end_idx] = 2.0
+                self.weights[i, start_idx:end_idx] = 3.0  # 更高的初始權重，提升後500類表現
     
     def forward(self, predictions):
         """
@@ -146,25 +139,9 @@ class StackingMetaModel(nn.Module):
         """
         # 堆疊所有預測 [batch_size, num_models, num_classes]
         stacked = torch.stack(predictions, dim=1)
-        batch_size = stacked.size(0)
         
-        # 計算權重 - 混合線性加權和softmax
-        normalized_weights = F.softmax(self.weights / self.temperature, dim=0)
-        
-        # 套用前500類與後500類的不同權重
-        balance_weights = torch.ones_like(normalized_weights)
-        balance_weights[:, :500] *= self.front_weight  # 前500類套用front_weight
-        balance_weights[:, 500:] *= self.back_weight   # 後500類套用back_weight
-        
-        # 最終權重結合softmax正規化和線性加權
-        final_weights = normalized_weights * balance_weights
-        
-        # 重新正規化確保權重有合理比例
-        final_weights = final_weights / final_weights.sum(dim=0, keepdim=True)
-        final_weights = final_weights.unsqueeze(0)  # 添加batch維度 [1, num_models, num_classes]
-        
-        # 加權平均所有預測 [batch_size, num_classes]
-        weighted_preds = (stacked * final_weights).sum(dim=1)
+        # 直接使用權重進行線性加權，不使用softmax
+        weighted_preds = (stacked * self.weights.unsqueeze(0)).sum(dim=1)
         
         return weighted_preds
 
