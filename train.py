@@ -397,9 +397,9 @@ def train_task(args, train_loader, current_task, prototype={}, pre_index=0):
             print("將重新初始化生成器和判別器")
             generator = Generator(feat_dim=2048, latent_dim=args.latent_dim, hidden_dim=args.hidden_dim, class_dim=args.num_class)
             discriminator = Discriminator(feat_dim=2048, hidden_dim=args.hidden_dim, class_dim=args.num_class)
-            generator_old = deepcopy(generator)
-            generator_old.eval()
-            generator_old = freeze_model(generator_old)
+        generator_old = deepcopy(generator)
+        generator_old.eval()
+        generator_old = freeze_model(generator_old)
 
     generator = generator.cuda()
     discriminator = discriminator.cuda()
@@ -1164,7 +1164,7 @@ def load_model_safely(model_path):
             return model
         except Exception as e2:
             print(f"備選加載方法也失敗: {e2}")
-            raise
+        raise
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Generative Feature Replay Training')
