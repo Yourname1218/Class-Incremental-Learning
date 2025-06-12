@@ -16,7 +16,7 @@ from utils import *
 from sklearn.metrics.pairwise import euclidean_distances
 from scipy.special import softmax
 from CIFAR100 import CIFAR100
-from models.resnet import ResNet_Cifar
+from models.resnet import ResNet_Cifar, ResNet_ImageNet, BasicBlock, Bottleneck
 from torch.serialization import add_safe_globals
 
 import matplotlib.pyplot as plt
@@ -96,16 +96,20 @@ print('Test starting -->\t')
 acc_all = np.zeros((num_task+3, num_task+1), dtype = 'float') # Save for csv
 
 # 註冊安全的全局類
-add_safe_globals([ResNet_Cifar])
+add_safe_globals([ResNet_Cifar, ResNet_ImageNet, BasicBlock, Bottleneck])
 
 def load_model_safely(model_path):
     try:
-        # 首先嘗試使用 weights_only=True
-        model = torch.load(model_path, weights_only=True)
+        # 直接使用 weights_only=False 加載模型
+        model = torch.load(model_path, weights_only=False)
     except Exception as e:
-        print(f"Warning: Failed to load with weights_only=True, falling back to full load: {e}")
-        # 如果失敗，回退到完整加載
-        model = torch.load(model_path)
+        print(f"Error loading model with weights_only=False: {e}")
+        try:
+            # 如果失敗，嘗試其它方法
+            model = torch.load(model_path, map_location='cpu', weights_only=False)
+        except Exception as e2:
+            print(f"All loading methods failed: {e2}")
+            raise
     return model
 
 def test_task(args, test_loader, current_task, model):
@@ -233,6 +237,9 @@ if __name__ == '__main__':
     parser.add_argument('-seed', default=1993, type=int, help='Random seed')
     parser.add_argument('-epochs', default=201, type=int, help='Number of epochs')
     parser.add_argument('-top5', action='store_true', help='Report top-5 accuracy')
+    # 添加特徵維度參數，默認為 ResNet50 的 2048
+    parser.add_argument('-feat_dim', type=int, default=2048, help="Feature dimension")
+    parser.add_argument('-hidden_dim', type=int, default=512, help="Hidden dimension")
     
     args = parser.parse_args()
     

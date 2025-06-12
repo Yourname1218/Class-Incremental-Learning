@@ -11,6 +11,8 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.backends import cudnn
 from torch.autograd import Variable
 import models
+from torch.serialization import add_safe_globals
+from models.resnet import ResNet_ImageNet, ResNet_Cifar, Generator, Discriminator, BasicBlock, Bottleneck
 
 from utils import RandomIdentitySampler, mkdir_if_missing, logging, display,truncated_z_sample
 from torch.optim.lr_scheduler import StepLR
@@ -29,7 +31,10 @@ from datetime import datetime
 import math
 import shutil
 import json
+import seaborn as sns
 
+# 將需要的類添加到安全列表中
+add_safe_globals([ResNet_ImageNet, ResNet_Cifar, Generator, Discriminator, BasicBlock, Bottleneck, ClassifierMLP, ModelCNN])
 
 cudnn.benchmark = True
 from copy import deepcopy
@@ -244,6 +249,58 @@ class DynamicLossWeights:
             'performance_history': self.performance_history
         }
 
+def validate_generator(generator, model, num_classes, latent_dim, current_task=0, batch_size=128):
+    """驗證生成器對各類別特徵的生成質量"""
+    generator.eval()
+    model.eval()
+    
+    samples_per_class = 100  # 每類生成100個樣本進行驗證
+    device = next(model.parameters()).device
+    
+    class_accuracies = np.zeros(num_classes)
+    class_counts = np.zeros(num_classes)
+    
+    # 遍歷所有類別
+    with torch.no_grad():
+        for cls_idx in range(num_classes):
+            # 為當前類別創建標籤
+            labels = torch.full((samples_per_class,), cls_idx, device=device).long()
+            
+            # 創建one-hot編碼
+            y_onehot = torch.zeros(samples_per_class, num_classes, device=device)
+            y_onehot.scatter_(1, labels.unsqueeze(1), 1)
+            
+            # 生成隨機噪聲
+            z = torch.randn(samples_per_class, latent_dim, device=device)
+            
+            # 生成特徵
+            gen_features = generator(z, y_onehot)
+            
+            # 使用當前模型進行分類
+            logits = model.embed(gen_features)
+            
+            # 計算準確率
+            preds = torch.argmax(logits, dim=1)
+            accuracy = (preds == labels).float().mean().item()
+            
+            class_accuracies[cls_idx] = accuracy
+            class_counts[cls_idx] = samples_per_class
+    
+    # 計算總體準確率
+    overall_acc = class_accuracies.mean()
+    
+    # 特別關注前500類的準確率
+    front_acc = class_accuracies[:500].mean() if num_classes > 500 else overall_acc
+    
+    # 不在這裡繪製熱圖，因為外部已有繪圖邏輯
+    
+    return {
+        'overall_acc': overall_acc,
+        'front_acc': front_acc,
+        'class_accuracies': class_accuracies,
+        'class_counts': class_counts
+    }
+
 def train_task(args, train_loader, current_task, prototype={}, pre_index=0):
     num_class_per_task = (args.num_class-args.nb_cl_fg) // args.num_task
     task_range = list(range(args.nb_cl_fg + (current_task - 1) * num_class_per_task, args.nb_cl_fg + current_task * num_class_per_task))
@@ -257,36 +314,74 @@ def train_task(args, train_loader, current_task, prototype={}, pre_index=0):
     sys.stdout = logging.Logger(os.path.join(log_dir, 'log_task{}.txt'.format(current_task)))
     tb_writer = SummaryWriter(log_dir)
     display(args)
+    
+    # 確保所有需要的類都已經被註冊為安全
+    add_safe_globals([ResNet_ImageNet, ResNet_Cifar, Generator, Discriminator, BasicBlock, Bottleneck, ClassifierMLP, ModelCNN])
+    
     # One-hot encoding or attribute encoding
     if 'imagenet' in args.data or 'medicine' in args.data:
-        model = models.create('resnet18_imagenet', pretrained=False, feat_dim=args.feat_dim,embed_dim=args.num_class)
+        model = models.create('resnet50_imagenet', pretrained=False, feat_dim=512, embed_dim=args.num_class)
     elif 'cifar' in args.data:
-        model = models.create('resnet18_cifar', pretrained=False, feat_dim=args.feat_dim,embed_dim=args.num_class)
-
+        model = models.create('resnet50_cifar', pretrained=False, feat_dim=512, embed_dim=args.num_class)
 
     if current_task > 0:
         try:
-            # 加載模型時的路徑
+            # 修改模型加載邏輯：優先嘗試加載微調後的生成器
             model_path = os.path.join(log_dir, f'task_{str(current_task - 1).zfill(2)}_{args.epochs - 1}_model.pkl')
-            generator_path = os.path.join(log_dir, f'task_{str(current_task - 1).zfill(2)}_{args.epochs_gan - 1}_model_generator.pkl')
+            
+            # 檢查是否存在微調後的生成器
+            finetuned_generator_path = os.path.join(log_dir, f'task_{str(current_task - 1).zfill(2)}_finetuned_generator.pkl')
+            original_generator_path = os.path.join(log_dir, f'task_{str(current_task - 1).zfill(2)}_{args.epochs_gan - 1}_model_generator.pkl')
             discriminator_path = os.path.join(log_dir, f'task_{str(current_task - 1).zfill(2)}_{args.epochs_gan - 1}_model_discriminator.pkl')
             
             print(f"Loading previous models from:")
             print(f"Model: {model_path}")
-            print(f"Generator: {generator_path}")
+            
+            # 優先嘗試加載微調後的生成器
+            if os.path.exists(finetuned_generator_path):
+                print(f"Generator (Finetuned): {finetuned_generator_path}")
+                generator_path = finetuned_generator_path
+            else:
+                print(f"Generator (Original): {original_generator_path}")
+                generator_path = original_generator_path
+                
             print(f"Discriminator: {discriminator_path}")
             
-            # 直接加載整個模型
-            model = torch.load(model_path)
+            def safe_load(path, desc):
+                """安全地加載模型，包含多種嘗試策略"""
+                try:
+                    print(f"嘗試加載 {desc}，使用 weights_only=False")
+                    return torch.load(path, weights_only=False)
+                except Exception as e1:
+                    print(f"使用 weights_only=False 加載 {desc} 失敗: {e1}")
+                    try:
+                        print(f"嘗試加載 {desc}，使用 pickle.load")
+                        import pickle
+                        with open(path, 'rb') as f:
+                            return pickle.load(f)
+                    except Exception as e2:
+                        print(f"使用 pickle.load 加載 {desc} 失敗: {e2}")
+                        try:
+                            print(f"最後嘗試使用 torch.load 搭配 map_location='cpu'")
+                            return torch.load(path, weights_only=False, map_location='cpu')
+                        except Exception as e3:
+                            print(f"所有加載方法都失敗: {e3}")
+                            raise RuntimeError(f"無法加載 {desc}")
+            
+            # 嘗試安全加載主模型
+            print("加載主模型...")
+            model = safe_load(model_path, "主模型")
             model = model.cuda()
             
             model_old = deepcopy(model)
             model_old.eval()
             model_old = freeze_model(model_old)
             
-            # 加載生成器和判別器
-            generator = torch.load(generator_path)
-            discriminator = torch.load(discriminator_path)
+            # 嘗試安全加載生成器（優先使用微調後的）
+            print("加載生成器...")
+            generator = safe_load(generator_path, "生成器")
+            print("加載判別器...")
+            discriminator = safe_load(discriminator_path, "判別器")
             
             generator = generator.cuda()
             discriminator = discriminator.cuda()
@@ -299,16 +394,17 @@ def train_task(args, train_loader, current_task, prototype={}, pre_index=0):
         except Exception as e:
             print(f"Error loading models: {e}")
             raise
+
     else:
         # 第一個任務的初始化
         if 'imagenet' in args.data or 'medicine' in args.data:
-            model = models.create('resnet18_imagenet', pretrained=False, feat_dim=args.feat_dim,embed_dim=args.num_class)
+            model = models.create('resnet50_imagenet', pretrained=False, feat_dim=512, embed_dim=args.num_class)
         elif 'cifar' in args.data:
-            model = models.create('resnet18_cifar', pretrained=False, feat_dim=args.feat_dim,embed_dim=args.num_class)
+            model = models.create('resnet50_cifar', pretrained=False, feat_dim=512, embed_dim=args.num_class)
         model = model.cuda()
         
-        generator = Generator(feat_dim=args.feat_dim,latent_dim=args.latent_dim, hidden_dim=args.hidden_dim, class_dim=args.num_class).cuda()
-        discriminator = Discriminator(feat_dim=args.feat_dim,hidden_dim=args.hidden_dim, class_dim=args.num_class).cuda()
+        generator = Generator(feat_dim=512, latent_dim=args.latent_dim, hidden_dim=512, class_dim=args.num_class).cuda()
+        discriminator = Discriminator(feat_dim=512, hidden_dim=512, class_dim=args.num_class).cuda()
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = StepLR(optimizer, step_size=args.lr_decay_step, gamma=args.lr_decay)
@@ -320,11 +416,51 @@ def train_task(args, train_loader, current_task, prototype={}, pre_index=0):
     lambda_lwf = args.gan_tradeoff
     # Initialize generator and discriminator
     if current_task == 0:
-        generator = Generator(feat_dim=args.feat_dim,latent_dim=args.latent_dim, hidden_dim=args.hidden_dim, class_dim=args.num_class)
-        discriminator = Discriminator(feat_dim=args.feat_dim,hidden_dim=args.hidden_dim, class_dim=args.num_class)
+        generator = Generator(feat_dim=512, latent_dim=args.latent_dim, hidden_dim=512, class_dim=args.num_class)
+        discriminator = Discriminator(feat_dim=512, hidden_dim=512, class_dim=args.num_class)
     else:
-        generator = torch.load(os.path.join(log_dir, 'task_' + str(current_task - 1).zfill(2) + '_%d_model_generator.pkl' % int(args.epochs_gan - 1)))
-        discriminator = torch.load(os.path.join(log_dir, 'task_' + str(current_task - 1).zfill(2) + '_%d_model_discriminator.pkl' % int(args.epochs_gan - 1)))
+        try:
+            generator_path = os.path.join(log_dir, 'task_' + str(current_task - 1).zfill(2) + '_%d_model_generator.pkl' % int(args.epochs_gan - 1))
+            discriminator_path = os.path.join(log_dir, 'task_' + str(current_task - 1).zfill(2) + '_%d_model_discriminator.pkl' % int(args.epochs_gan - 1))
+            
+            print(f"Loading generator from: {generator_path}")
+            print(f"Loading discriminator from: {discriminator_path}")
+            
+            def safe_load(path, desc):
+                """安全地加載模型，包含多種嘗試策略"""
+                try:
+                    print(f"嘗試加載 {desc}，使用 weights_only=False")
+                    return torch.load(path, weights_only=False)
+                except Exception as e1:
+                    print(f"使用 weights_only=False 加載 {desc} 失敗: {e1}")
+                    try:
+                        print(f"嘗試加載 {desc}，使用 pickle.load")
+                        import pickle
+                        with open(path, 'rb') as f:
+                            return pickle.load(f)
+                    except Exception as e2:
+                        print(f"使用 pickle.load 加載 {desc} 失敗: {e2}")
+                        try:
+                            print(f"最後嘗試使用 torch.load 搭配 map_location='cpu'")
+                            return torch.load(path, weights_only=False, map_location='cpu')
+                        except Exception as e3:
+                            print(f"所有加載方法都失敗: {e3}")
+                            raise RuntimeError(f"無法加載 {desc}")
+            
+            # 嘗試安全加載生成器和判別器
+            print("加載生成器...")
+            generator = safe_load(generator_path, "生成器")
+            print("加載判別器...")
+            discriminator = safe_load(discriminator_path, "判別器")
+            
+            generator_old = deepcopy(generator)
+            generator_old.eval()
+            generator_old = freeze_model(generator_old)
+        except Exception as e:
+            print(f"錯誤: 無法加載生成器或判別器: {e}")
+            print("將重新初始化生成器和判別器")
+            generator = Generator(feat_dim=512, latent_dim=args.latent_dim, hidden_dim=512, class_dim=args.num_class)
+            discriminator = Discriminator(feat_dim=512, hidden_dim=512, class_dim=args.num_class)
         generator_old = deepcopy(generator)
         generator_old.eval()
         generator_old = freeze_model(generator_old)
@@ -390,8 +526,14 @@ def train_task(args, train_loader, current_task, prototype={}, pre_index=0):
                                 std=std_values)
         ])
         valdir = os.path.join('medicine_picture', 'valid')
-        # 使用與訓練相同的class_index
-        valfolder = ImageFolder(valdir, transform=transform_val, index=class_index)
+        # 修改：使用累積的所有類別進行驗證，而不是只驗證當前任務的類別
+        if current_task == 0:
+            cumulative_index = class_index  # Task 0: [0-499]
+        else:
+            # 累積所有已學習的類別
+            cumulative_index = list(range(args.nb_cl_fg + current_task * num_class_per_task))
+        
+        valfolder = ImageFolder(valdir, transform=transform_val, index=cumulative_index)
         val_loader = torch.utils.data.DataLoader(
             valfolder, batch_size=args.BatchSize,
             shuffle=False, num_workers=args.nThreads)
@@ -399,10 +541,16 @@ def train_task(args, train_loader, current_task, prototype={}, pre_index=0):
         # CIFAR驗證資料集
         np.random.seed(args.seed)
         target_transform = np.random.permutation(num_classes)
+        # 修改：使用累積的所有類別進行驗證
+        if current_task == 0:
+            cumulative_index = class_index
+        else:
+            cumulative_index = list(range(args.nb_cl_fg + current_task * num_class_per_task))
+        
         valset = CIFAR100(root=traindir, train=False, download=True, 
                          transform=transform_train, 
                          target_transform=target_transform, 
-                         index=class_index)
+                         index=cumulative_index)
         val_loader = torch.utils.data.DataLoader(
             valset, batch_size=args.BatchSize,
             shuffle=False, num_workers=args.nThreads)
@@ -475,25 +623,51 @@ def train_task(args, train_loader, current_task, prototype={}, pre_index=0):
                     embed_sythesis = torch.from_numpy(embed_sythesis).cuda()
                     embed_label_sythesis = torch.from_numpy(embed_label_sythesis).cuda().long()
                 else:
-                    for _ in range(args.BatchSize):
-                        np.random.shuffle(ind)
-                        embed_label_sythesis.append(pre_index[ind[0]])
+                    # 修改生成特徵的採樣邏輯：優先採樣前500類
+                    # 將舊類別分為前500類和其他類別
+                    front_indices = [idx for idx in pre_index if idx < 500]
+                    other_indices = [idx for idx in pre_index if idx >= 500]
                     
-                    # 確保標籤在 GPU 上並且是正確的類型
-                    embed_label_sythesis = torch.tensor(embed_label_sythesis, 
-                                                      dtype=torch.long, 
-                                                      device='cuda')
+                    # 設定前500類的採樣比例
+                    front_ratio = 0.7  # 70%樣本來自前500類
+                    batch_front = int(args.BatchSize * front_ratio)
+                    batch_other = args.BatchSize - batch_front
                     
+                    # 從前500類中採樣
+                    front_labels = []
+                    if front_indices:
+                        for _ in range(batch_front):
+                            front_labels.append(np.random.choice(front_indices))
+                    
+                    # 從其他舊類別中採樣
+                    other_labels = []
+                    if other_indices:
+                        for _ in range(batch_other):
+                            other_labels.append(np.random.choice(other_indices))
+                    elif front_indices:  # 如果沒有其他類別，從前500類補充
+                        for _ in range(batch_other):
+                            front_labels.append(np.random.choice(front_indices))
+                    
+                    # 合併標籤
+                    combined_labels = front_labels + other_labels
+                    embed_label_sythesis = torch.tensor(combined_labels, dtype=torch.long, device='cuda')
+                    
+                    # 準備one-hot標籤
                     y_onehot.zero_()
-                    # 確保標籤是 int64 類型
                     y_onehot.scatter_(1, embed_label_sythesis.view(-1, 1).long(), 1)
                     syn_label_pre = y_onehot.cuda()
-
-                    z = torch.randn(args.BatchSize, args.latent_dim).cuda()
                     
+                    # 生成特徵
+                    z = torch.randn(len(embed_label_sythesis), args.latent_dim).cuda()
                     embed_sythesis = generator(z, syn_label_pre)
+                    
+                    # 記錄前500類採樣比例
+                    if i % 20 == 0:  # 每20個批次輸出一次
+                        front_count = sum(1 for label in embed_label_sythesis.cpu().numpy() if label < 500)
+                        front_percent = front_count / len(embed_label_sythesis) * 100
+                        print(f"批次 {i}：前500類採樣比例 = {front_percent:.2f}%")
                 
-                # 確保所有張量都在 GPU 上
+                # 合併真實特徵和生成特徵
                 embed_sythesis = torch.cat((embed_feat, embed_sythesis))
                 embed_label_sythesis = torch.cat((labels, embed_label_sythesis))
                 soft_feat_syt = model.embed(embed_sythesis)
@@ -530,7 +704,8 @@ def train_task(args, train_loader, current_task, prototype={}, pre_index=0):
 
         if epoch == args.epochs-1:
             model_save_path = os.path.join(log_dir, f'task_{str(current_task).zfill(2)}_{epoch}_model.pkl')
-            torch.save(model, model_save_path)
+            # 使用 _use_new_zipfile_serialization=False 以確保兼容性
+            torch.save(model, model_save_path, _use_new_zipfile_serialization=False)
             print(f"Saved model to: {model_save_path}")
 
         # 收集數據
@@ -663,21 +838,65 @@ def train_task(args, train_loader, current_task, prototype={}, pre_index=0):
                     fake_validity, _ = discriminator(fake_feat, syn_label)
 
                     if current_task > 0:
-                        ind = list(range(len(pre_index)))
-                        embed_label_sythesis = []
-                        for _ in range(batch_size):
-                            np.random.shuffle(ind)
-                            embed_label_sythesis.append(pre_index[ind[0]])
-
-                        embed_label_sythesis = torch.tensor(embed_label_sythesis).cuda().long()
+                        # 準備前500類和後續類別的比例
+                        front_ratio = 0.7  # 70%採樣前500類
+                        batch_front = int(batch_size * front_ratio)
+                        batch_other = batch_size - batch_front
+                        
+                        # 為前500類準備標籤
+                        front_labels = []
+                        if batch_front > 0:
+                            # 只從前500類中選擇
+                            front_indices = [idx for idx in pre_index if idx < 500]
+                            if len(front_indices) > 0:
+                                for _ in range(batch_front):
+                                    # 從前500類中隨機選擇
+                                    front_labels.append(np.random.choice(front_indices))
+                        
+                        # 為其他類別準備標籤
+                        other_labels = []
+                        if batch_other > 0:
+                            # 從所有舊類別中選擇
+                            ind = list(range(len(pre_index)))
+                            for _ in range(batch_other):
+                                np.random.shuffle(ind)
+                                other_labels.append(pre_index[ind[0]])
+                        
+                        # 合併標籤
+                        embed_label_sythesis = torch.tensor(front_labels + other_labels, 
+                                                          dtype=torch.long, 
+                                                          device='cuda')
+                        
+                        # 準備one-hot標籤
                         y_onehot.zero_()
-                        # 確保標籤是 int64 類型
                         y_onehot.scatter_(1, embed_label_sythesis.view(-1, 1).long(), 1)
                         syn_label_pre = y_onehot[:batch_size]
-
-                        pre_feat = generator(z, syn_label_pre)
-                        pre_feat_old = generator_old(z, syn_label_pre)
-                        lwf_loss = torch.nn.MSELoss()(pre_feat, pre_feat_old)
+                        
+                        # 生成特徵並計算與舊生成器的一致性損失
+                        z_pre = torch.randn(len(embed_label_sythesis), args.latent_dim).cuda()
+                        pre_feat = generator(z_pre, syn_label_pre)
+                        pre_feat_old = generator_old(z_pre, syn_label_pre)
+                        
+                        # 計算不同類別範圍的一致性損失
+                        front_mask = (embed_label_sythesis < 500)
+                        
+                        # 為前500類設置更高的損失權重
+                        if torch.any(front_mask):
+                            lwf_front = F.mse_loss(
+                                pre_feat[front_mask], 
+                                pre_feat_old[front_mask]
+                            ) * 2.0  # 增加前500類權重
+                            
+                            if torch.any(~front_mask):
+                                lwf_other = F.mse_loss(
+                                    pre_feat[~front_mask], 
+                                    pre_feat_old[~front_mask]
+                                )
+                                lwf_loss = (lwf_front * front_mask.sum() + lwf_other * (~front_mask).sum()) / len(embed_label_sythesis)
+                            else:
+                                lwf_loss = lwf_front
+                        else:
+                            lwf_loss = F.mse_loss(pre_feat, pre_feat_old)
                     else:
                         lwf_loss = torch.zeros(1).cuda()
 
@@ -719,11 +938,116 @@ def train_task(args, train_loader, current_task, prototype={}, pre_index=0):
                 generator_save_path = os.path.join(log_dir, f'task_{str(current_task).zfill(2)}_{epoch}_model_generator.pkl')
                 discriminator_save_path = os.path.join(log_dir, f'task_{str(current_task).zfill(2)}_{epoch}_model_discriminator.pkl')
                 
-                torch.save(generator, generator_save_path)
-                torch.save(discriminator, discriminator_save_path)
+                # 使用 _use_new_zipfile_serialization=False 以確保兼容性
+                torch.save(generator, generator_save_path, _use_new_zipfile_serialization=False)
+                torch.save(discriminator, discriminator_save_path, _use_new_zipfile_serialization=False)
                 
                 print(f"Saved generator to: {generator_save_path}")
                 print(f"Saved discriminator to: {discriminator_save_path}")
+        
+        # GAN 訓練結束後，評估生成器質量
+        if current_task > 0:
+            print("評估生成器對每個類別的生成質量...")
+            gen_quality = validate_generator(
+                generator, model, args.num_class, args.latent_dim, current_task
+            )
+            
+            print(f"生成器質量評估：")
+            print(f"整體準確率: {gen_quality['overall_acc']:.4f}")
+            print(f"前500類準確率: {gen_quality['front_acc']:.4f}")
+            
+            # 繪製類別準確率熱圖
+            plt.figure(figsize=(20, 5))
+            plt.bar(range(args.num_class), gen_quality['class_accuracies'])
+            plt.xlabel('Class Index')
+            plt.ylabel('Classification Accuracy')
+            plt.title(f'Generator Quality at Task {current_task}')
+            plt.savefig(os.path.join(log_dir, f'generator_quality_task_{current_task}.png'))
+            plt.close()
+            
+            # 識別表現不佳的前500類
+            poor_classes = []
+            for cls_idx in range(500):
+                if gen_quality['class_accuracies'][cls_idx] < 0.3:  # 降低閾值到30%
+                    poor_classes.append(cls_idx)
+            
+            if len(poor_classes) > 0:
+                print(f"發現 {len(poor_classes)} 個表現不佳的前500類，進行生成器微調")
+                
+                # 創建微調數據集
+                finetune_epochs = 50
+                finetune_batch_size = 32
+                
+                # 創建微調圖表
+                ft_losses = {'epochs': [], 'mse_loss': [], 'cls_loss': [], 'total_loss': []}
+                
+                for ft_epoch in range(finetune_epochs):
+                    # 每個批次隨機選擇一些表現不佳的類別
+                    selected_classes = np.random.choice(poor_classes, finetune_batch_size, replace=True)
+                    selected_classes = torch.tensor(selected_classes, dtype=torch.long).cuda()
+                    
+                    # 準備one-hot標籤
+                    ft_y_onehot = torch.zeros(finetune_batch_size, args.num_class).cuda()
+                    ft_y_onehot.scatter_(1, selected_classes.view(-1, 1), 1)
+                    
+                    # 使用舊生成器生成特徵
+                    z = torch.randn(finetune_batch_size, args.latent_dim).cuda()
+                    ft_feat_old = generator_old(z, ft_y_onehot)
+                    
+                    # 訓練當前生成器
+                    optimizer_G.zero_grad()
+                    ft_feat = generator(z, ft_y_onehot)
+                    
+                    # 與舊生成器保持一致（知識蒸餾）
+                    ft_mse_loss = F.mse_loss(ft_feat, ft_feat_old)
+                    
+                    # 額外的質量約束：生成的特徵應該能被分類器正確分類
+                    ft_outputs = model.embed(ft_feat)
+                    ft_cls_loss = F.cross_entropy(ft_outputs, selected_classes)
+                    
+                    # 組合損失：調整權重比例，降低MSE損失權重，提高分類損失權重
+                    ft_loss = ft_mse_loss * 0.5 + ft_cls_loss * 1.0
+                    ft_loss.backward()
+                    optimizer_G.step()
+                    
+                    # 收集損失數據
+                    ft_losses['epochs'].append(ft_epoch + 1)
+                    ft_losses['mse_loss'].append(ft_mse_loss.item())
+                    ft_losses['cls_loss'].append(ft_cls_loss.item())
+                    ft_losses['total_loss'].append(ft_loss.item())
+                    
+                    if ft_epoch % 10 == 0:
+                        print(f"微調生成器 Epoch {ft_epoch}/{finetune_epochs}, "
+                             f"MSE Loss: {ft_mse_loss.item():.4f}, "
+                             f"Cls Loss: {ft_cls_loss.item():.4f}, "
+                             f"Total Loss: {ft_loss.item():.4f}")
+                        
+                        # 繪製微調損失圖
+                        plt.figure(figsize=(10, 6))
+                        plt.plot(ft_losses['epochs'], ft_losses['mse_loss'], label='MSE Loss')
+                        plt.plot(ft_losses['epochs'], ft_losses['cls_loss'], label='Cls Loss')
+                        plt.plot(ft_losses['epochs'], ft_losses['total_loss'], label='Total Loss')
+                        plt.xlabel('Epoch')
+                        plt.ylabel('Loss')
+                        plt.title(f'Generator Finetuning for Task {current_task}')
+                        plt.legend()
+                        plt.savefig(os.path.join(log_dir, f'generator_finetuning_task_{current_task}.png'))
+                        plt.close()
+                
+                    # 微調結束後重新評估
+                    print("微調後重新評估生成器質量...")
+                    ft_gen_quality = validate_generator(
+                        generator, model, args.num_class, args.latent_dim, current_task
+                    )
+                    
+                    print(f"微調後生成器質量評估：")
+                    print(f"整體準確率: {ft_gen_quality['overall_acc']:.4f} (之前: {gen_quality['overall_acc']:.4f})")
+                    print(f"前500類準確率: {ft_gen_quality['front_acc']:.4f} (之前: {gen_quality['front_acc']:.4f})")
+                    
+                    # 保存微調後的生成器
+                    ft_generator_save_path = os.path.join(log_dir, f'task_{str(current_task).zfill(2)}_finetuned_generator.pkl')
+                    torch.save(generator, ft_generator_save_path, _use_new_zipfile_serialization=False)
+                    print(f"保存微調後的生成器到: {ft_generator_save_path}")
 
         # 訓練結束時關閉圖表
         if gan_fig is not None:
@@ -1074,6 +1398,24 @@ def restore_project(backup_dir, target_dir=None):
         print(f"\n恢復過程中發生錯誤: {str(e)}")
         raise
 
+def load_model_safely(model_path):
+    """安全地加載模型，處理 PyTorch 2.6+ 的安全限制"""
+    try:
+        model = torch.load(model_path, weights_only=False)
+        return model
+    except Exception as e:
+        print(f"錯誤: 無法加載模型 {model_path}: {e}")
+        # 嘗試備選方案
+        try:
+            print("嘗試使用備選加載方法...")
+            # 設置 safe_globals 上下文管理器
+            with torch.serialization.safe_globals([ResNet_ImageNet, ResNet_Cifar, Generator, Discriminator, BasicBlock, Bottleneck, ClassifierMLP, ModelCNN]):
+                model = torch.load(model_path, weights_only=True)
+            return model
+        except Exception as e2:
+            print(f"備選加載方法也失敗: {e2}")
+        raise
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Generative Feature Replay Training')
 
@@ -1106,13 +1448,13 @@ if __name__ == '__main__':
     parser.add_argument('-weight-decay', type=float, default=2e-4)
 
     # hype-parameters for W-GAN
-    parser.add_argument('-gan_tradeoff', type=float, default=1.2e-3)
+    parser.add_argument('-gan_tradeoff', type=float, default=2.0e-3)
     parser.add_argument('-gan_lr', type=float, default=5e-5)
     parser.add_argument('-lambda_gp', type=float, default=7.0)
     parser.add_argument('-n_critic', type=int, default=3)
 
     parser.add_argument('-latent_dim', type=int, default=200, help="learning rate of new parameters")
-    parser.add_argument('-feat_dim', type=int, default=512, help="learning rate of new parameters")
+    parser.add_argument('-feat_dim', type=int, default=2048, help="learning rate of new parameters")
     parser.add_argument('-hidden_dim', type=int, default=512, help="learning rate of new parameters")
     
     # training parameters
