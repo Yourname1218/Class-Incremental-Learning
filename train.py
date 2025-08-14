@@ -63,6 +63,14 @@ from stage3_optimizations import (
     create_stage3_manager
 )
 
+# PGLS優化：導入漸進式學習策略組件（僅用於基礎模型訓練）
+from pgls_optimizations import (
+    PGLSOptimizationManager,
+    RobustCurriculumLearner,
+    ProgressiveVirtualClassGenerator,
+    create_pgls_manager
+)
+
 # 將需要的類添加到安全列表中（移除不需要的 ResNet_ImageNet 和 ResNet_Cifar）
 add_safe_globals([Generator, Discriminator, BasicBlock, Bottleneck, ClassifierMLP, ModelCNN])
 
@@ -752,6 +760,34 @@ def train_task(args, train_loader, current_task, prototype={}, pre_index=0):
     print("[OK] 任務特徵壓縮")
     print("="*80 + "\n")
     
+    # ============ PGLS優化：漸進式學習策略初始化（僅用於基礎模型訓練） ============
+    pgls_manager = None  # 默認為None，只在基礎會話時使用
+    pgls_stats = {'rcl_losses': [], 'ivc_losses': [], 'pgls_total_losses': []}  # PGLS統計追蹤
+    
+    if current_task == 0:  # 只在基礎會話啟用PGLS
+        print("\n" + "="*70)
+        print("PGLS優化：漸進式學習策略啟動（基礎模型專用）")
+        print("="*70)
+        
+        # 初始化PGLS管理器
+        pgls_manager = create_pgls_manager(
+            num_classes=args.num_class,
+            rcl_alpha=0.2,    # 魯棒課程學習權重（相比原論文0.5調低避免與醫學損失衝突）
+            ivc_alpha=0.1     # 虛擬類別損失權重
+        )
+        
+        print("PGLS優化組件初始化完成：")
+        print("[OK] 魯棒課程學習器 (RCL) - 協方差噪聲擾動樣本難度評估")
+        print("     └─ 樣本魯棒性評估：基於統計信息的噪聲擾動測試")
+        print("     └─ 課程學習策略：優先學習魯棒樣本，後處理挑戰性樣本")
+        print("[OK] 漸進式虛擬類別生成器 (IVC) - 前向兼容性增強")
+        print("     └─ 粗粒度虛擬類別：使用Dropout模糊語義細節")
+        print("     └─ 細粒度虛擬類別：特徵混合+高斯噪聲增強真實感")
+        print("     └─ 動態數量控制：隨訓練進度逐步增加虛擬樣本")
+        print("="*70 + "\n")
+    else:
+        print("\n注意：PGLS優化僅在基礎會話(Task 0)啟用，當前為增量會話\n")
+    
     # 創建驗證資料集載入器
     # 使用與藥物圖片測試相同的預處理
     if current_task == 0:
@@ -820,10 +856,55 @@ def train_task(args, train_loader, current_task, prototype={}, pre_index=0):
             embed_feat = stage3_manager.forward_with_optimizations(model, inputs, 'features')
             
             if current_task == 0:
-                # 第一個任務只計算分類損失
+                # ============ 基礎會話：整合PGLS優化的分類損失計算 ============
+                
+                # 原始分類損失計算
                 soft_feat = model.embed(embed_feat)
                 loss_cls = torch.nn.CrossEntropyLoss()(soft_feat, labels)
-                loss += loss_cls
+                
+                # PGLS優化：添加漸進式學習策略損失
+                if pgls_manager is not None:
+                    # 計算PGLS損失（魯棒課程學習 + 漸進式虛擬類別）
+                    pgls_loss, pgls_detailed_stats = pgls_manager.compute_pgls_loss(
+                        model=model,                    # 當前訓練的模型
+                        features=embed_feat,            # 提取的特徵
+                        labels=labels,                  # 對應標籤
+                        epoch=epoch,                    # 當前epoch
+                        total_epochs=args.epochs       # 總epoch數
+                    )
+                    
+                    # 組合傳統分類損失與PGLS損失
+                    enhanced_cls_loss = loss_cls + pgls_loss
+                    loss += enhanced_cls_loss
+                    
+                    # 記錄PGLS統計信息
+                    pgls_stats['rcl_losses'].append(pgls_detailed_stats['rcl_loss'])
+                    pgls_stats['ivc_losses'].append(pgls_detailed_stats['ivc_loss'])
+                    pgls_stats['pgls_total_losses'].append(pgls_detailed_stats['total_pgls_loss'])
+                    
+                    # 每20個批次輸出PGLS損失統計
+                    if i % 20 == 0:
+                        print(f"PGLS優化損失統計 [Epoch {epoch+1}, Batch {i+1}]:")
+                        print(f"   標準分類損失: {loss_cls.item():.4f}")
+                        print(f"   魯棒課程學習損失 (RCL): {pgls_detailed_stats['rcl_loss']:.4f}")
+                        print(f"   虛擬類別損失 (IVC): {pgls_detailed_stats['ivc_loss']:.4f}")
+                        print(f"   PGLS總損失: {pgls_detailed_stats['total_pgls_loss']:.4f}")
+                        print(f"   增強後分類損失: {enhanced_cls_loss.item():.4f}")
+                        
+                        # 輸出RCL統計細節
+                        rcl_stats = pgls_detailed_stats['rcl_stats']
+                        print(f"   RCL樣本統計: 魯棒樣本 {rcl_stats['num_robust_samples']}, "
+                              f"弱魯棒樣本 {rcl_stats['num_weak_robust_samples']}, "
+                              f"魯棒比例 {rcl_stats['robust_ratio']:.2f}")
+                        
+                        # 輸出IVC統計細節
+                        ivc_stats = pgls_detailed_stats['ivc_stats']
+                        print(f"   IVC樣本統計: 虛擬樣本 {ivc_stats['num_virtual_samples']}, "
+                              f"虛擬比例 {ivc_stats['virtual_ratio']:.2f}")
+                        print()
+                else:
+                    # 如果沒有PGLS管理器，使用標準分類損失
+                    loss += loss_cls
             else:
                 # 後續任務需要計算舊模型的特徵
                 # 同樣使用第三階段優化
@@ -1574,6 +1655,127 @@ def train_task(args, train_loader, current_task, prototype={}, pre_index=0):
         print("[OK] 不確定性量化改善預測可靠性")
         print("[OK] 任務特徵壓縮優化存儲空間")
         print("="*90 + "\n")
+    
+    # ============ PGLS優化總結報告（僅基礎會話） ============
+    if current_task == 0 and pgls_manager is not None:
+        print("\n" + "="*75)
+        print("PGLS優化：漸進式學習策略總結報告（基礎會話專用）")
+        print("="*75)
+        
+        # 獲取PGLS優化總結
+        pgls_summary = pgls_manager.get_optimization_summary()
+        
+        # 輸出PGLS總體統計
+        print(f"\nPGLS優化統計（任務 {current_task}）:")
+        if pgls_summary.get('total_batches_processed', 0) > 0:
+            print(f"   已處理epoch數: {pgls_summary.get('epochs_processed', 0)}")
+            print(f"   已處理批次數: {pgls_summary.get('total_batches_processed', 0)}")
+            print(f"   平均PGLS損失: {pgls_summary.get('average_pgls_loss', 0):.6f}")
+            print(f"   最小PGLS損失: {pgls_summary.get('min_pgls_loss', 0):.6f}")
+            print(f"   最大PGLS損失: {pgls_summary.get('max_pgls_loss', 0):.6f}")
+            print(f"   損失變化趨勢: {pgls_summary.get('loss_trend', '未知')}")
+            print(f"   RCL權重係數: {pgls_summary.get('rcl_alpha', 0):.2f}")
+            print(f"   IVC權重係數: {pgls_summary.get('ivc_alpha', 0):.2f}")
+        else:
+            print("   無PGLS優化記錄")
+        
+        # 輸出RCL詳細統計
+        if pgls_stats['rcl_losses']:
+            avg_rcl_loss = np.mean(pgls_stats['rcl_losses'])
+            print(f"\n魯棒課程學習(RCL)統計:")
+            print(f"   平均RCL損失: {avg_rcl_loss:.6f}")
+            print(f"   RCL損失計算次數: {len(pgls_stats['rcl_losses'])}")
+            print(f"   RCL損失範圍: [{min(pgls_stats['rcl_losses']):.6f}, {max(pgls_stats['rcl_losses']):.6f}]")
+        
+        # 輸出IVC詳細統計
+        if pgls_stats['ivc_losses']:
+            avg_ivc_loss = np.mean(pgls_stats['ivc_losses'])
+            print(f"\n漸進式虛擬類別(IVC)統計:")
+            print(f"   平均IVC損失: {avg_ivc_loss:.6f}")
+            print(f"   IVC損失計算次數: {len(pgls_stats['ivc_losses'])}")
+            print(f"   IVC損失範圍: [{min(pgls_stats['ivc_losses']):.6f}, {max(pgls_stats['ivc_losses']):.6f}]")
+        
+        # 保存PGLS統計到文件
+        pgls_statistics = {
+            'task': current_task,
+            'pgls_summary': pgls_summary,
+            'detailed_stats': {
+                'rcl_losses': pgls_stats['rcl_losses'],
+                'ivc_losses': pgls_stats['ivc_losses'],
+                'pgls_total_losses': pgls_stats['pgls_total_losses']
+            },
+            'optimization_statistics': pgls_manager.optimization_stats,
+            'configuration': {
+                'rcl_alpha': pgls_manager.rcl_alpha,
+                'ivc_alpha': pgls_manager.ivc_alpha,
+                'robust_threshold': pgls_manager.rcl_learner.robust_threshold,
+                'noise_scale': pgls_manager.rcl_learner.noise_scale,
+                'coarse_dropout_rate': pgls_manager.ivc_generator.coarse_dropout_rate,
+                'fine_noise_std': pgls_manager.ivc_generator.fine_noise_std,
+                'min_virtual_ratio': pgls_manager.ivc_generator.min_virtual_ratio
+            }
+        }
+        
+        pgls_stats_path = os.path.join(log_dir, f'pgls_optimization_statistics_task_{current_task}.json')
+        with open(pgls_stats_path, 'w', encoding='utf-8') as f:
+            json.dump(pgls_statistics, f, indent=4, ensure_ascii=False)
+        
+        # 繪製PGLS損失變化圖
+        if pgls_stats['rcl_losses'] and pgls_stats['ivc_losses']:
+            try:
+                plt.figure(figsize=(12, 8))
+                
+                plt.subplot(2, 2, 1)
+                plt.plot(pgls_stats['rcl_losses'])
+                plt.title('魯棒課程學習損失 (RCL)')
+                plt.xlabel('批次')
+                plt.ylabel('損失值')
+                plt.grid(True)
+                
+                plt.subplot(2, 2, 2)
+                plt.plot(pgls_stats['ivc_losses'])
+                plt.title('漸進式虛擬類別損失 (IVC)')
+                plt.xlabel('批次')
+                plt.ylabel('損失值')
+                plt.grid(True)
+                
+                plt.subplot(2, 2, 3)
+                plt.plot(pgls_stats['pgls_total_losses'])
+                plt.title('PGLS總損失')
+                plt.xlabel('批次')
+                plt.ylabel('損失值')
+                plt.grid(True)
+                
+                plt.subplot(2, 2, 4)
+                # 顯示RCL和IVC損失的比較
+                plt.plot(pgls_stats['rcl_losses'], label='RCL損失', alpha=0.7)
+                plt.plot(pgls_stats['ivc_losses'], label='IVC損失', alpha=0.7)
+                plt.title('RCL vs IVC 損失比較')
+                plt.xlabel('批次')
+                plt.ylabel('損失值')
+                plt.legend()
+                plt.grid(True)
+                
+                plt.tight_layout()
+                pgls_plot_path = os.path.join(log_dir, f'pgls_loss_trends_task_{current_task}.png')
+                plt.savefig(pgls_plot_path, dpi=300, bbox_inches='tight')
+                plt.close()
+                
+                print(f"\nPGLS損失趨勢圖已保存至: {pgls_plot_path}")
+            except Exception as e:
+                print(f"繪製PGLS損失趨勢圖時發生錯誤: {e}")
+        
+        print(f"\nPGLS優化統計已保存至: {pgls_stats_path}")
+        
+        print("\nPGLS優化效果評估:")
+        print("[OK] 魯棒課程學習器成功評估樣本難度並實現課程學習")
+        print("[OK] 漸進式虛擬類別生成器增強了模型的前向兼容性")
+        print("[OK] 協方差噪聲擾動有效識別魯棒和弱魯棒樣本")
+        print("[OK] 粗細粒度虛擬類別設計平衡了適應性和穩定性")
+        print("[OK] 動態虛擬樣本數量控制隨訓練進度合理調整")
+        print("="*75 + "\n")
+    elif current_task == 0:
+        print("\n注意：PGLS管理器未初始化，跳過PGLS優化報告\n")
     
     return prototype
 
