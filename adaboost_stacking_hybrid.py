@@ -105,34 +105,64 @@ class AdaBoostStackingHybrid:
     
     def compute_stacking_weights(self, val_loader):
         """
-        使用Stacking方式計算模型權重
-        基於整體驗證集表現，而非專業範圍限制
+        使用混合權重策略計算模型權重
+        結合全局性能（60%）和專業領域加成（40%）+ 置信度感知動態投票
         """
-        print("使用Stacking方式計算模型權重...")
+        print("使用混合權重策略計算模型權重...")
+        print("策略：60%全局性能 + 40%專業領域加成（增強版）")
         
         # 收集驗證集上的預測
         model_predictions, true_labels = self.collect_all_predictions(val_loader, "驗證集評估")
         
-        # 計算每個模型在整體驗證集上的準確率
+        # 計算每個模型的全局性能和專業領域性能
         self.model_errors = []
         individual_accuracies = []
+        specialist_accuracies = []
+        specialist_bonuses = []
         
         for i, predictions in enumerate(model_predictions):
             # 獲取預測類別
             predicted_classes = torch.argmax(predictions, dim=1)
             
-            # 計算準確率
-            accuracy = accuracy_score(true_labels.numpy(), predicted_classes.numpy())
-            individual_accuracies.append(accuracy)
+            # 1. 計算全局準確率（所有1000類）
+            global_accuracy = accuracy_score(true_labels.numpy(), predicted_classes.numpy())
+            individual_accuracies.append(global_accuracy)
             
-            # 計算錯誤率
-            error_rate = 1.0 - accuracy
-            self.model_errors.append(error_rate)
+            # 2. 計算專業領域準確率（該模型的專精類別範圍）
+            class_range = self.class_ranges[i]
+            specialist_mask = (true_labels >= class_range[0]) & (true_labels <= class_range[1])
             
-            print(f"模型 {i+1:2d}: 準確率={accuracy:.4f}, 錯誤率={error_rate:.4f}")
+            if specialist_mask.sum() > 0:
+                specialist_predictions = predicted_classes[specialist_mask]
+                specialist_labels = true_labels[specialist_mask]
+                specialist_accuracy = accuracy_score(specialist_labels.numpy(), specialist_predictions.numpy())
+            else:
+                specialist_accuracy = global_accuracy  # 如果沒有專業類別樣本，使用全局性能
+            
+            specialist_accuracies.append(specialist_accuracy)
+            
+            # 3. 計算專業加成系數（專業準確率相對於全局準確率的提升）
+            if global_accuracy > 0:
+                specialist_bonus = max(0, (specialist_accuracy - global_accuracy) / global_accuracy)
+            else:
+                specialist_bonus = 0
+            
+            # 限制專業加成在合理範圍內（最大50%提升）
+            specialist_bonus = min(specialist_bonus, 0.5)
+            specialist_bonuses.append(specialist_bonus)
+            
+            print(f"模型 {i+1:2d} (類別 {class_range[0]:3d}-{class_range[1]:3d}): "
+                  f"全局準確率={global_accuracy:.4f}, 專業準確率={specialist_accuracy:.4f}, "
+                  f"專業加成={specialist_bonus:.4f}")
+            
+            # 4. 計算綜合錯誤率（用於AdaBoost權重公式）
+            global_error = 1.0 - global_accuracy
+            self.model_errors.append(global_error)
         
-        # 使用AdaBoost權重公式，但基於整體表現
-        self.model_weights = []
+        print("\n🔄 計算混合權重...")
+        
+        # 使用AdaBoost公式計算基礎權重（基於全局性能）
+        global_weights = []
         for i, error_rate in enumerate(self.model_errors):
             # 避免除零和權重過大
             error_rate = max(error_rate, 1e-10)
@@ -143,9 +173,40 @@ class AdaBoostStackingHybrid:
             else:
                 weight = 1e-6  # 表現差的模型給極小權重
             
-            self.model_weights.append(weight)
+            global_weights.append(weight)
         
-        # 權重正規化（確保總和為1）
+        # 正規化全局權重
+        total_global_weight = sum(global_weights)
+        if total_global_weight > 1e-6:
+            global_weights = [w / total_global_weight for w in global_weights]
+        else:
+            global_weights = [1.0 / len(self.models) for _ in self.models]
+        
+        # 計算專業加成權重（基於專業加成系數）
+        specialist_weights = []
+        for i, bonus in enumerate(specialist_bonuses):
+            # 專業權重 = 1 + 專業加成系數
+            specialist_weight = 1.0 + bonus
+            specialist_weights.append(specialist_weight)
+        
+        # 正規化專業權重
+        total_specialist_weight = sum(specialist_weights)
+        if total_specialist_weight > 0:
+            specialist_weights = [w / total_specialist_weight for w in specialist_weights]
+        else:
+            specialist_weights = [1.0 / len(self.models) for _ in self.models]
+        
+        # 混合權重：60%全局 + 40%專業（增強專業權重）
+        self.model_weights = []
+        global_weight_ratio = 0.6
+        specialist_weight_ratio = 0.4
+        
+        for i in range(len(self.models)):
+            hybrid_weight = (global_weight_ratio * global_weights[i] + 
+                           specialist_weight_ratio * specialist_weights[i])
+            self.model_weights.append(hybrid_weight)
+        
+        # 最終權重正規化
         total_weight = sum(self.model_weights)
         if total_weight > 1e-6:
             self.model_weights = [w / total_weight for w in self.model_weights]
@@ -153,18 +214,35 @@ class AdaBoostStackingHybrid:
             # 如果所有權重都極小，使用均等權重
             self.model_weights = [1.0 / len(self.models) for _ in self.models]
         
-        print("\n🎯 Stacking方式權重計算完成：")
-        for i, (error, weight, acc) in enumerate(zip(self.model_errors, self.model_weights, individual_accuracies)):
+        print("\n🎯 混合權重策略計算完成：")
+        for i in range(len(self.models)):
             class_range = self.class_ranges[i]
+            global_acc = individual_accuracies[i]
+            specialist_acc = specialist_accuracies[i]
+            bonus = specialist_bonuses[i]
+            final_weight = self.model_weights[i]
+            
             print(f"模型 {i+1:2d} (類別 {class_range[0]:3d}-{class_range[1]:3d}): "
-                  f"準確率={acc:.4f}, 錯誤率={error:.4f}, AdaBoost權重={weight:.4f}")
+                  f"全局準確率={global_acc:.4f}, 專業準確率={specialist_acc:.4f}, "
+                  f"專業加成={bonus:.4f}, 混合權重={final_weight:.4f}")
+        
+        # 計算權重分佈統計
+        weight_max = max(self.model_weights)
+        weight_min = min(self.model_weights)
+        weight_std = np.std(self.model_weights)
+        
+        print(f"\n📊 權重分佈統計:")
+        print(f"   最大權重: {weight_max:.4f}")
+        print(f"   最小權重: {weight_min:.4f}")
+        print(f"   權重標準差: {weight_std:.4f}")
+        print(f"   權重平衡度: {1.0 / (1.0 + weight_std):.4f}")
         
         return self.model_weights
     
     def adaboost_weighted_voting(self, model_predictions):
         """
-        AdaBoost最終決策：加權投票
-        與Stacking不同，這裡是所有模型參與投票，而非選擇單一模型
+        AdaBoost進階決策：置信度感知動態加權投票
+        結合靜態權重和動態置信度調整
         """
         # 確保預測在相同設備上
         device = model_predictions[0].device if isinstance(model_predictions[0], torch.Tensor) else 'cpu'
@@ -175,13 +253,44 @@ class AdaBoostStackingHybrid:
         else:
             numpy_predictions = model_predictions
         
-        # AdaBoost加權求和
+        # 1. 計算每個模型每個樣本的置信度（最大概率）
+        confidences = []
+        for pred in numpy_predictions:
+            # 應用softmax並計算最大概率作為置信度
+            softmax_pred = np.exp(pred - np.max(pred, axis=1, keepdims=True))
+            softmax_pred = softmax_pred / np.sum(softmax_pred, axis=1, keepdims=True)
+            confidence = np.max(softmax_pred, axis=1)
+            confidences.append(confidence)
+        
+        confidences = np.array(confidences)  # shape: (num_models, num_samples)
+        
+        # 2. 計算動態權重：基礎權重 × 置信度調製
+        batch_size = numpy_predictions[0].shape[0]
+        dynamic_weights = np.zeros((len(self.model_weights), batch_size))
+        
+        for i in range(len(self.model_weights)):
+            # 置信度調製因子（高置信度時權重增強）
+            confidence_boost = 1.0 + 0.5 * (confidences[i] - 0.5)  # 0.75 到 1.25 的調製範圍
+            dynamic_weights[i] = self.model_weights[i] * confidence_boost
+        
+        # 3. 樣本級權重正規化
+        weight_sums = np.sum(dynamic_weights, axis=0)
+        for i in range(len(self.model_weights)):
+            dynamic_weights[i] = dynamic_weights[i] / (weight_sums + 1e-8)
+        
+        # 4. 動態加權求和
         weighted_sum = np.zeros_like(numpy_predictions[0])
         
         for i, pred in enumerate(numpy_predictions):
-            weighted_sum += self.model_weights[i] * pred
+            # 每個樣本使用不同的權重
+            for j in range(batch_size):
+                weighted_sum[j] += dynamic_weights[i, j] * pred[j]
         
-        # argmax選擇最終類別
+        # 5. 溫度縮放改善校準（溫度=1.2，輕微平滑）
+        temperature = 1.2
+        weighted_sum = weighted_sum / temperature
+        
+        # 6. 最終預測
         final_predictions = np.argmax(weighted_sum, axis=1)
         
         return final_predictions, weighted_sum
