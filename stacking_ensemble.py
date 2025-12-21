@@ -14,6 +14,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
+from collections import Counter
+import json
 
 # 添加調試輸出
 print("腳本開始執行...")
@@ -29,6 +31,7 @@ parser.add_argument('-lr', type=float, default=0.001, help='Learning rate for me
 parser.add_argument('-val_split', type=float, default=0.7, help='Portion of data to use for meta-model training')
 parser.add_argument('-gpu', type=str, default='0', help='GPU to use')
 parser.add_argument('--eval_only', action='store_true', help='只評估不重新訓練（需已有訓練好的模型）')
+parser.add_argument('--use_confidence', action='store_true', help='使用置信度特徵增強Meta Model（推薦）')
 args = parser.parse_args()
 
 # 打印參數
@@ -145,6 +148,99 @@ class StackingMetaModel(nn.Module):
         
         return weighted_preds
 
+# 支持置信度特徵的改進Meta Model
+class StackingMetaModelWithConfidence(nn.Module):
+    def __init__(self, num_models, num_classes=1000, actual_model_output_dim=None):
+        super(StackingMetaModelWithConfidence, self).__init__()
+        self.num_models = num_models
+        self.num_classes = num_classes
+        
+        # 動態檢測實際模型輸出維度
+        if actual_model_output_dim is None:
+            # 根據檢查結果，所有Base Model的embed層都是1000維
+            print("✅ 使用標準配置：Base Model輸出維度 = 1000")
+            self.actual_model_dim = num_classes  # 默認1000
+        else:
+            self.actual_model_dim = actual_model_output_dim
+            print(f"✅ 使用檢測到的Base Model輸出維度: {actual_model_output_dim}")
+            
+        # 每個模型貢獻: 預測(actual_dim) + 置信度(1) + 熵(1) + 一致性(1)
+        input_dim_per_model = self.actual_model_dim + 3
+        total_input_dim = num_models * input_dim_per_model
+        
+        print(f"✅ Enhanced Meta Model with confidence features")
+        print(f"   📊 Detected model output dim: {self.actual_model_dim}")
+        print(f"   📊 Input per model: {input_dim_per_model} (predictions + 3 confidence features)")
+        print(f"   📊 Total input dim: {total_input_dim}")
+        
+        # 根據實際輸入維度調整網路架構
+        # 改進：使用更深的4層架構，降低Dropout避免過度正則化
+        if total_input_dim > 8000:
+            # 大輸入維度架構 - 4層深度網絡
+            hidden_dims = [2048, 1024, 512, 256]
+        elif total_input_dim > 4000:
+            # 中等輸入維度架構 - 4層深度網絡
+            hidden_dims = [1024, 512, 256, 128]
+        else:
+            # 小輸入維度架構 - 4層深度網絡
+            hidden_dims = [512, 256, 128, 64]
+        
+        self.meta_network = nn.Sequential(
+            # 第1層：保留更多信息
+            nn.Linear(total_input_dim, hidden_dims[0]),
+            nn.BatchNorm1d(hidden_dims[0]),
+            nn.ReLU(),
+            nn.Dropout(0.4),  # 降低正則化: 0.5 → 0.4
+            
+            # 第2層：漸進壓縮
+            nn.Linear(hidden_dims[0], hidden_dims[1]),
+            nn.BatchNorm1d(hidden_dims[1]),
+            nn.ReLU(),
+            nn.Dropout(0.3),  # 降低正則化: 0.4 → 0.3
+            
+            # 第3層：進一步抽象
+            nn.Linear(hidden_dims[1], hidden_dims[2]),
+            nn.BatchNorm1d(hidden_dims[2]),
+            nn.ReLU(),
+            nn.Dropout(0.2),  # 降低正則化: 0.3 → 0.2
+            
+            # 第4層：最終特徵提取（新增）
+            nn.Linear(hidden_dims[2], hidden_dims[3]),
+            nn.BatchNorm1d(hidden_dims[3]),
+            nn.ReLU(),
+            nn.Dropout(0.1),  # 輕微正則化
+            
+            # 輸出層
+            nn.Linear(hidden_dims[3], num_classes)
+        )
+        
+        print(f"   🏗️ Architecture: {total_input_dim} -> {hidden_dims[0]} -> {hidden_dims[1]} -> {hidden_dims[2]} -> {hidden_dims[3]} -> {num_classes}")
+    
+    def forward(self, enhanced_predictions):
+        """
+        輸入: enhanced_predictions - List of dicts, each containing:
+               {'predictions': tensor, 'confidence': tensor, 'entropy': tensor, 'agreement': tensor}
+        """
+        batch_size = enhanced_predictions[0]['predictions'].size(0)
+        combined_features = []
+        
+        for model_output in enhanced_predictions:
+            predictions = model_output['predictions']  # [batch_size, num_classes]
+            confidence = model_output['confidence'].unsqueeze(1)  # [batch_size, 1]
+            entropy = model_output['entropy'].unsqueeze(1)  # [batch_size, 1]
+            agreement = model_output['agreement'].unsqueeze(1)  # [batch_size, 1]
+            
+            # 連接預測和置信度特徵 [batch_size, num_classes + 3]
+            model_features = torch.cat([predictions, confidence, entropy, agreement], dim=1)
+            combined_features.append(model_features)
+        
+        # 合併所有模型的特徵 [batch_size, num_models * (num_classes + 3)]
+        input_features = torch.cat(combined_features, dim=1)
+        
+        # 通過神經網路得到最終預測
+        output = self.meta_network(input_features)
+        return output
+
 # 收集基礎模型的預測
 def collect_predictions(models, dataloader):
     all_predictions = []
@@ -177,14 +273,248 @@ def collect_predictions(models, dataloader):
     
     return X, y
 
+# 收集基礎模型的預測和置信度特徵
+def collect_predictions_with_confidence(models, dataloader):
+    """
+    收集Base Model預測並計算三種置信度特徵
+    返回格式: List of dicts, each containing predictions and confidence features
+    """
+    all_enhanced_predictions = [[] for _ in range(len(models))]
+    all_labels = []
+    
+    print("🔍 Collecting predictions with confidence features...")
+    
+    with torch.no_grad():
+        for batch_idx, (images, labels) in enumerate(tqdm(dataloader, desc="收集增強預測")):
+            images, labels = images.cuda(), labels.cuda()
+            
+            # 收集所有模型對當前batch的預測
+            batch_predictions = []
+            batch_raw_predictions = []
+            
+            for model in models:
+                # 正確的兩階段調用：特徵提取 + 分類
+                features = model(images)  # 提取特徵 (512維)
+                outputs = model.embed(features)  # 分類輸出 (1000維)
+                probabilities = F.softmax(outputs, dim=1)
+                batch_predictions.append(torch.argmax(probabilities, dim=1))  # 預測類別
+                batch_raw_predictions.append(probabilities)  # 概率分佈
+            
+            # 為每個模型計算置信度特徵
+            for model_idx in range(len(models)):
+                model_probs = batch_raw_predictions[model_idx]  # [batch_size, num_classes]
+                
+                # 1. 最大概率置信度
+                confidence_scores = torch.max(model_probs, dim=1)[0]  # [batch_size]
+                
+                # 2. 預測熵 (不確定性)
+                epsilon = 1e-8
+                entropy_scores = -torch.sum(model_probs * torch.log(model_probs + epsilon), dim=1)  # [batch_size]
+                
+                # 3. 模型間一致性 (對當前樣本，所有模型預測的一致程度)
+                batch_size = model_probs.size(0)
+                agreement_scores = torch.zeros(batch_size).cuda()
+                
+                for sample_idx in range(batch_size):
+                    # 當前樣本所有模型的預測類別
+                    sample_predictions = [batch_predictions[m][sample_idx].item() for m in range(len(models))]
+                    # 計算最常見預測的占比
+                    from collections import Counter
+                    most_common_count = Counter(sample_predictions).most_common(1)[0][1]
+                    agreement_scores[sample_idx] = most_common_count / len(models)
+                
+                # 組織該模型的輸出
+                model_output = {
+                    'predictions': model_probs.cpu(),  # [batch_size, num_classes]
+                    'confidence': confidence_scores.cpu(),  # [batch_size]
+                    'entropy': entropy_scores.cpu(),  # [batch_size]
+                    'agreement': agreement_scores.cpu()  # [batch_size]
+                }
+                
+                all_enhanced_predictions[model_idx].append(model_output)
+            
+            all_labels.append(labels.cpu())
+    
+    # 合併所有批次的結果
+    final_enhanced_predictions = []
+    
+    for model_idx in range(len(models)):
+        # 合併該模型所有批次的預測和特徵
+        model_predictions = torch.cat([batch['predictions'] for batch in all_enhanced_predictions[model_idx]], dim=0)
+        model_confidences = torch.cat([batch['confidence'] for batch in all_enhanced_predictions[model_idx]], dim=0)
+        model_entropies = torch.cat([batch['entropy'] for batch in all_enhanced_predictions[model_idx]], dim=0)
+        model_agreements = torch.cat([batch['agreement'] for batch in all_enhanced_predictions[model_idx]], dim=0)
+        
+        final_enhanced_predictions.append({
+            'predictions': model_predictions,
+            'confidence': model_confidences,
+            'entropy': model_entropies,
+            'agreement': model_agreements
+        })
+    
+    # 合併所有標籤
+    y = torch.cat(all_labels, dim=0).long()
+    
+    print(f"✅ Enhanced predictions collected:")
+    print(f"   📊 Models: {len(final_enhanced_predictions)}")
+    print(f"   📊 Samples: {len(y)}")
+    print(f"   📊 Features per model: predictions + confidence + entropy + agreement")
+    
+    # 輸出置信度特徵的統計信息
+    print(f"\n📈 Confidence Features Statistics:")
+    for i, model_data in enumerate(final_enhanced_predictions):
+        avg_conf = model_data['confidence'].mean().item()
+        avg_entropy = model_data['entropy'].mean().item()
+        avg_agreement = model_data['agreement'].mean().item()
+        print(f"   Model {i+1:2d}: Conf={avg_conf:.3f}, Entropy={avg_entropy:.3f}, Agreement={avg_agreement:.3f}")
+    
+    return final_enhanced_predictions, y
+
+# 動態檢測Base Model的實際輸出維度
+def detect_model_output_dim(models, dataloader):
+    """
+    檢測Base Model的實際分類輸出維度
+    """
+    print("🔍 動態檢測Base Model分類輸出維度...")
+    
+    with torch.no_grad():
+        for images, _ in dataloader:
+            images = images.cuda()
+            # 正確的檢測方式：特徵提取 + 分類層
+            features = models[0](images)  # 提取特徵 (通常是512維)
+            logits = models[0].embed(features)  # 分類輸出 (1000維)
+            actual_dim = logits.size(1)  # [batch_size, num_classes]
+            
+            print(f"   📊 特徵維度: {features.size(1)}")
+            print(f"   📊 檢測到Base Model分類輸出維度: {actual_dim}")
+            return actual_dim
+    
+    # 如果無法檢測，返回默認值
+    print("   ⚠️ 無法檢測輸出維度，使用默認值 1000")
+    return 1000
+
+# 繪製訓練過程曲線
+def plot_training_curves(train_losses, train_accuracies, val_losses, val_accuracies, 
+                        learning_rates, output_dir, best_acc):
+    """
+    繪製Meta Model訓練過程的詳細視覺化圖表
+    """
+    epochs = range(1, len(train_losses) + 1)
+    
+    # 創建包含4個子圖的大圖
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+    
+    # 設置整體標題
+    fig.suptitle(f'Meta Model Training Progress (Best Val Acc: {best_acc:.2f}%)', 
+                fontsize=16, fontweight='bold')
+    
+    # 1. 損失函數曲線
+    ax1.plot(epochs, train_losses, 'b-', label='Training Loss', linewidth=2, alpha=0.8)
+    ax1.plot(epochs, val_losses, 'r-', label='Validation Loss', linewidth=2, alpha=0.8)
+    ax1.set_title('Loss Curves', fontsize=12, fontweight='bold')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # 標記最低驗證loss
+    min_val_loss_idx = val_losses.index(min(val_losses))
+    ax1.annotate(f'Min Val Loss\n{min(val_losses):.4f}', 
+                xy=(min_val_loss_idx + 1, min(val_losses)),
+                xytext=(10, 10), textcoords='offset points',
+                bbox=dict(boxstyle='round,pad=0.5', fc='yellow', alpha=0.7),
+                arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0'))
+    
+    # 2. 準確率曲線
+    ax2.plot(epochs, train_accuracies, 'b-', label='Training Accuracy', linewidth=2, alpha=0.8)
+    ax2.plot(epochs, val_accuracies, 'r-', label='Validation Accuracy', linewidth=2, alpha=0.8)
+    ax2.set_title('Accuracy Curves', fontsize=12, fontweight='bold')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Accuracy (%)')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    # 標記最高驗證accuracy
+    max_val_acc_idx = val_accuracies.index(max(val_accuracies))
+    ax2.annotate(f'Best Accuracy\n{max(val_accuracies):.2f}%', 
+                xy=(max_val_acc_idx + 1, max(val_accuracies)),
+                xytext=(10, -15), textcoords='offset points',
+                bbox=dict(boxstyle='round,pad=0.5', fc='lightgreen', alpha=0.7),
+                arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0'))
+    
+    # 3. 學習率變化
+    ax3.plot(epochs, learning_rates, 'g-', linewidth=2, alpha=0.8)
+    ax3.set_title('Learning Rate Schedule', fontsize=12, fontweight='bold')
+    ax3.set_xlabel('Epoch')
+    ax3.set_ylabel('Learning Rate')
+    ax3.set_yscale('log')  # 使用對數刻度更好顯示學習率變化
+    ax3.grid(True, alpha=0.3)
+    
+    # 4. 訓練收斂性分析
+    # 計算移動平均來觀察收斂趨勢
+    window = min(10, len(val_accuracies) // 10)  # 窗口大小
+    if window > 1:
+        val_acc_smooth = []
+        for i in range(len(val_accuracies)):
+            start_idx = max(0, i - window + 1)
+            val_acc_smooth.append(sum(val_accuracies[start_idx:i+1]) / (i - start_idx + 1))
+        
+        ax4.plot(epochs, val_accuracies, 'lightcoral', alpha=0.5, label='Raw Validation Accuracy')
+        ax4.plot(epochs, val_acc_smooth, 'red', linewidth=2, label=f'Moving Average (window={window})')
+    else:
+        ax4.plot(epochs, val_accuracies, 'red', linewidth=2, label='Validation Accuracy')
+    
+    ax4.set_title('Convergence Analysis', fontsize=12, fontweight='bold')
+    ax4.set_xlabel('Epoch')
+    ax4.set_ylabel('Validation Accuracy (%)')
+    ax4.legend()
+    ax4.grid(True, alpha=0.3)
+    
+    # 添加收斂判斷
+    if len(val_accuracies) > 20:
+        last_20_std = np.std(val_accuracies[-20:])
+        convergence_text = "Converged" if last_20_std < 0.5 else "May need more epochs"
+        ax4.text(0.02, 0.98, f'Status: {convergence_text}\nLast 20 epochs std: {last_20_std:.3f}',
+                transform=ax4.transAxes, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    
+    # 調整布局
+    plt.tight_layout()
+    
+    # 保存圖表
+    plot_path = os.path.join(output_dir, 'meta_model_training_curves.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+    plt.close()
+    
+    print(f"📊 Training visualization saved: {plot_path}")
+    
+    # 保存訓練數據到CSV
+    import csv
+    csv_path = os.path.join(output_dir, 'meta_model_training_log.csv')
+    with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['Epoch', 'Train_Loss', 'Train_Acc(%)', 'Val_Loss', 'Val_Acc(%)', 'Learning_Rate'])
+        for i in range(len(train_losses)):
+            writer.writerow([i+1, f'{train_losses[i]:.6f}', f'{train_accuracies[i]:.2f}', 
+                           f'{val_losses[i]:.6f}', f'{val_accuracies[i]:.2f}', f'{learning_rates[i]:.8f}'])
+    
+    print(f"📋 Training log saved: {csv_path}")
+
 # 訓練元模型
-def train_meta_model(meta_model, train_predictions, train_labels, val_predictions, val_labels, epochs, lr):
+def train_meta_model(meta_model, train_predictions, train_labels, val_predictions, val_labels, epochs, lr, output_dir=None):
     optimizer = torch.optim.Adam(meta_model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
     
     best_acc = 0.0
     best_model_state = None
+    
+    # 記錄訓練過程的指標
+    train_losses = []
+    train_accuracies = []
+    val_losses = []
+    val_accuracies = []
+    learning_rates = []
     
     # 將數據移到GPU並確保是長整型
     train_labels = train_labels.cuda().long()
@@ -195,6 +525,9 @@ def train_meta_model(meta_model, train_predictions, train_labels, val_prediction
     batch_size = 32
     num_samples = train_labels.size(0)
     indices = torch.randperm(num_samples)
+    
+    print(f"\n🚀 Starting Meta Model Training - {epochs} epochs")
+    print("="*60)
     
     for epoch in range(epochs):
         meta_model.train()
@@ -257,7 +590,21 @@ def train_meta_model(meta_model, train_predictions, train_labels, val_prediction
             
             val_loss = val_loss / val_total
             val_acc = val_correct / val_total * 100
-            print(f'Epoch {epoch+1}/{epochs}, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
+        
+        # 記錄指標
+        train_losses.append(train_loss)
+        train_accuracies.append(train_acc)
+        val_losses.append(val_loss)
+        val_accuracies.append(val_acc)
+        current_lr = optimizer.param_groups[0]['lr']
+        learning_rates.append(current_lr)
+        
+        # 詳細的epoch輸出
+        if (epoch + 1) % 10 == 0 or epoch < 5:  # 前5個epoch和每10個epoch輸出詳細信息
+            print(f'Epoch {epoch+1:3d}/{epochs} | '
+                  f'Train: Loss={train_loss:.4f}, Acc={train_acc:.2f}% | '
+                  f'Val: Loss={val_loss:.4f}, Acc={val_acc:.2f}% | '
+                  f'LR={current_lr:.6f}')
         
         # 調整學習率
         scheduler.step(val_loss)
@@ -266,11 +613,341 @@ def train_meta_model(meta_model, train_predictions, train_labels, val_prediction
         if val_acc > best_acc:
             best_acc = val_acc
             best_model_state = meta_model.state_dict().copy()
-            print(f'新的最佳驗證準確率: {best_acc:.2f}%')
+            print(f'⭐ New best validation accuracy: {best_acc:.2f}% (Epoch {epoch+1})')
     
     # 恢復最佳模型
     meta_model.load_state_dict(best_model_state)
+    
+    print("="*60)
+    print(f"🏆 Meta Model Training Completed! Best Validation Accuracy: {best_acc:.2f}%")
+    
+    # 生成訓練過程視覺化圖表
+    if output_dir:
+        plot_training_curves(train_losses, train_accuracies, val_losses, val_accuracies, 
+                           learning_rates, output_dir, best_acc)
+    
     return meta_model, best_acc
+
+# 訓練支持置信度特徵的Meta Model
+def train_enhanced_meta_model(meta_model, train_enhanced_predictions, train_labels, 
+                              val_enhanced_predictions, val_labels, epochs, lr, output_dir=None):
+    """
+    訓練支持置信度特徵的Enhanced Meta Model
+    """
+    optimizer = torch.optim.Adam(meta_model.parameters(), lr=lr, weight_decay=1e-3)  # 增強L2正則化: 1e-5 → 1e-3
+    criterion = nn.CrossEntropyLoss()
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    
+    best_acc = 0.0
+    best_model_state = None
+    
+    # Early Stopping配置
+    early_stopping_patience = 15
+    early_stopping_counter = 0
+    early_stopping_min_delta = 0.1  # 最小改進幅度 (0.1%)
+    
+    # 記錄訓練過程的指標
+    train_losses = []
+    train_accuracies = []
+    val_losses = []
+    val_accuracies = []
+    learning_rates = []
+    
+    # 將標籤移到GPU
+    train_labels = train_labels.cuda().long()
+    val_labels = val_labels.cuda().long()
+    
+    # 將置信度特徵移到GPU
+    for model_data in train_enhanced_predictions:
+        model_data['predictions'] = model_data['predictions'].cuda()
+        model_data['confidence'] = model_data['confidence'].cuda()
+        model_data['entropy'] = model_data['entropy'].cuda()
+        model_data['agreement'] = model_data['agreement'].cuda()
+    
+    for model_data in val_enhanced_predictions:
+        model_data['predictions'] = model_data['predictions'].cuda()
+        model_data['confidence'] = model_data['confidence'].cuda()
+        model_data['entropy'] = model_data['entropy'].cuda()
+        model_data['agreement'] = model_data['agreement'].cuda()
+    
+    batch_size = 32
+    num_samples = train_labels.size(0)
+    
+    print(f"\n🚀 Starting Enhanced Meta Model Training with Regularization")
+    print("="*70)
+    print(f"📋 Training Configuration:")
+    print(f"   🔢 Total Epochs: {epochs}")
+    print(f"   📦 Batch Size: {batch_size}")
+    print(f"   📊 Training Samples: {num_samples}")
+    print(f"   📊 Validation Samples: {len(val_labels)}")
+    print(f"\n🛡️  Regularization Settings:")
+    print(f"   💧 Dropout Rates: 0.5 → 0.4 → 0.3 (increased from 0.3 → 0.2 → 0.1)")
+    print(f"   ⚖️  Weight Decay: {optimizer.param_groups[0]['weight_decay']:.0e} (L2 penalty)")
+    print(f"   ⏹️  Early Stopping: patience={early_stopping_patience}, min_delta={early_stopping_min_delta}%")
+    print(f"   📉 LR Scheduler: ReduceLROnPlateau (factor=0.5, patience=5)")
+    print("="*70)
+    
+    for epoch in range(epochs):
+        meta_model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+        
+        # 創建隨機批次索引
+        indices = torch.randperm(num_samples)
+        
+        for i in range(0, num_samples, batch_size):
+            batch_end = min(i + batch_size, num_samples)
+            batch_indices = indices[i:batch_end]
+            
+            # 提取批次數據 - 置信度特徵版本
+            batch_enhanced_predictions = []
+            for model_data in train_enhanced_predictions:
+                batch_model_data = {
+                    'predictions': model_data['predictions'][batch_indices],
+                    'confidence': model_data['confidence'][batch_indices],
+                    'entropy': model_data['entropy'][batch_indices],
+                    'agreement': model_data['agreement'][batch_indices]
+                }
+                batch_enhanced_predictions.append(batch_model_data)
+            
+            batch_train_labels = train_labels[batch_indices]
+            
+            # 前向傳播
+            outputs = meta_model(batch_enhanced_predictions)
+            loss = criterion(outputs, batch_train_labels)
+            
+            # 反向傳播和優化
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            # 統計
+            running_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += batch_train_labels.size(0)
+            correct += predicted.eq(batch_train_labels).sum().item()
+        
+        # 計算訓練準確率
+        train_loss = running_loss / total
+        train_acc = 100.0 * correct / total
+        
+        # 評估驗證集
+        meta_model.eval()
+        with torch.no_grad():
+            val_loss = 0.0
+            val_correct = 0
+            val_total = 0
+            
+            val_indices = torch.arange(len(val_labels))
+            for i in range(0, len(val_labels), batch_size):
+                batch_end = min(i + batch_size, len(val_labels))
+                batch_indices = val_indices[i:batch_end]
+                
+                # 提取驗證批次數據
+                batch_val_enhanced_predictions = []
+                for model_data in val_enhanced_predictions:
+                    batch_model_data = {
+                        'predictions': model_data['predictions'][batch_indices],
+                        'confidence': model_data['confidence'][batch_indices],
+                        'entropy': model_data['entropy'][batch_indices],
+                        'agreement': model_data['agreement'][batch_indices]
+                    }
+                    batch_val_enhanced_predictions.append(batch_model_data)
+                
+                batch_val_labels = val_labels[batch_indices]
+                
+                outputs = meta_model(batch_val_enhanced_predictions)
+                loss = criterion(outputs, batch_val_labels)
+                
+                val_loss += loss.item() * batch_val_labels.size(0)
+                _, predicted = torch.max(outputs.data, 1)
+                val_correct += (predicted == batch_val_labels).sum().item()
+                val_total += batch_val_labels.size(0)
+            
+            val_loss = val_loss / val_total
+            val_acc = val_correct / val_total * 100
+        
+        # 記錄指標
+        train_losses.append(train_loss)
+        train_accuracies.append(train_acc)
+        val_losses.append(val_loss)
+        val_accuracies.append(val_acc)
+        current_lr = optimizer.param_groups[0]['lr']
+        learning_rates.append(current_lr)
+        
+        # 詳細的epoch輸出
+        if (epoch + 1) % 10 == 0 or epoch < 5:
+            print(f'Epoch {epoch+1:3d}/{epochs} | '
+                  f'Train: Loss={train_loss:.4f}, Acc={train_acc:.2f}% | '
+                  f'Val: Loss={val_loss:.4f}, Acc={val_acc:.2f}% | '
+                  f'LR={current_lr:.6f}')
+        
+        # 調整學習率
+        scheduler.step(val_loss)
+        
+        # 保存最佳模型並檢查Early Stopping
+        if val_acc > best_acc + early_stopping_min_delta:
+            best_acc = val_acc
+            best_model_state = meta_model.state_dict().copy()
+            early_stopping_counter = 0  # 重置計數器
+            print(f'⭐ New best validation accuracy: {best_acc:.2f}% (Epoch {epoch+1})')
+        else:
+            early_stopping_counter += 1
+            if (epoch + 1) % 10 == 0:
+                print(f'⏳ No improvement for {early_stopping_counter} epochs (patience: {early_stopping_patience})')
+        
+        # Early Stopping檢查
+        if early_stopping_counter >= early_stopping_patience:
+            print("\n" + "="*60)
+            print(f"⏹️  Early Stopping triggered at Epoch {epoch+1}")
+            print(f"   📊 Best validation accuracy: {best_acc:.2f}%")
+            print(f"   ⏰ No improvement for {early_stopping_patience} consecutive epochs")
+            print(f"   💾 Restoring best model from Epoch {epoch+1-early_stopping_patience}")
+            print("="*60)
+            break
+    
+    # 恢復最佳模型
+    if best_model_state is not None:
+        meta_model.load_state_dict(best_model_state)
+    
+    print("\n" + "="*60)
+    print(f"🏆 Enhanced Meta Model Training Completed!")
+    print(f"   📊 Best Validation Accuracy: {best_acc:.2f}%")
+    print(f"   📅 Total Epochs Trained: {epoch+1}/{epochs}")
+    if early_stopping_counter >= early_stopping_patience:
+        print(f"   ⏹️  Stopped Early (saved {epochs - epoch - 1} epochs)")
+    print("="*60)
+    
+    # 生成訓練過程視覺化圖表
+    if output_dir:
+        plot_training_curves(train_losses, train_accuracies, val_losses, val_accuracies, 
+                           learning_rates, output_dir, best_acc)
+    
+    return meta_model, best_acc
+
+# 評估置信度增強的Meta Model
+def evaluate_enhanced_meta_model(meta_model, enhanced_predictions, test_labels, output_dir):
+    """
+    評估支持置信度特徵的Enhanced Meta Model
+    """
+    meta_model.eval()
+    test_labels = test_labels.cuda().long()
+    
+    # 將置信度特徵移到GPU
+    for model_data in enhanced_predictions:
+        model_data['predictions'] = model_data['predictions'].cuda()
+        model_data['confidence'] = model_data['confidence'].cuda()
+        model_data['entropy'] = model_data['entropy'].cuda()
+        model_data['agreement'] = model_data['agreement'].cuda()
+    
+    # 批次評估
+    batch_size = 32
+    num_samples = len(test_labels)
+    all_predictions = []
+    
+    print(f"📊 評估 {num_samples} 個樣本（批次大小: {batch_size}）...")
+    
+    with torch.no_grad():
+        for i in range(0, num_samples, batch_size):
+            batch_end = min(i + batch_size, num_samples)
+            batch_indices = torch.arange(i, batch_end)
+            
+            # 提取批次增強預測數據
+            batch_enhanced_predictions = []
+            for model_data in enhanced_predictions:
+                batch_model_data = {
+                    'predictions': model_data['predictions'][batch_indices],
+                    'confidence': model_data['confidence'][batch_indices],
+                    'entropy': model_data['entropy'][batch_indices],
+                    'agreement': model_data['agreement'][batch_indices]
+                }
+                batch_enhanced_predictions.append(batch_model_data)
+            
+            # Meta Model預測
+            outputs = meta_model(batch_enhanced_predictions)
+            _, predicted = torch.max(outputs.data, 1)
+            all_predictions.append(predicted)
+    
+    # 合併所有預測
+    all_predictions = torch.cat(all_predictions, dim=0)
+    
+    # 計算總體準確率
+    correct = (all_predictions == test_labels).sum().item()
+    total = test_labels.size(0)
+    overall_accuracy = 100.0 * correct / total
+    
+    print(f"🎯 置信度增強Meta Model測試準確率: {overall_accuracy:.2f}%")
+    
+    # 計算各類別準確率
+    class_correct = {}
+    class_total = {}
+    
+    for i in range(len(test_labels)):
+        label = test_labels[i].item()
+        pred = all_predictions[i].item()
+        
+        if label not in class_total:
+            class_total[label] = 0
+            class_correct[label] = 0
+        
+        class_total[label] += 1
+        if label == pred:
+            class_correct[label] += 1
+    
+    # 分析前500類和後500類的準確率
+    front_classes = [cls for cls in class_total.keys() if cls < 500]
+    back_classes = [cls for cls in class_total.keys() if cls >= 500]
+    
+    front_acc = np.mean([100.0 * class_correct[cls] / class_total[cls] for cls in front_classes]) if front_classes else 0
+    back_acc = np.mean([100.0 * class_correct[cls] / class_total[cls] for cls in back_classes]) if back_classes else 0
+    
+    print(f"📊 前500類平均準確率: {front_acc:.2f}%")
+    print(f"📊 後500類平均準確率: {back_acc:.2f}%")
+    
+    # 繪製結果可視化（重用現有的繪圖邏輯）
+    accuracies = []
+    class_indices = []
+    
+    for cls in sorted(class_total.keys()):
+        if class_total[cls] > 0:
+            acc = 100.0 * class_correct[cls] / class_total[cls]
+            accuracies.append(acc)
+            class_indices.append(cls)
+    
+    # 繪製柱狀圖
+    plt.figure(figsize=(12, 6))
+    plt.bar(class_indices, accuracies, alpha=0.7)
+    plt.axvline(x=500, color='r', linestyle='--', label='Class Boundary (500)')
+    plt.xlabel('Class Index')
+    plt.ylabel('Accuracy (%)')
+    plt.title('Enhanced Meta Model: Per-Class Accuracy Distribution')
+    plt.legend()
+    plt.tight_layout()
+    
+    # 保存圖表
+    plt.savefig(os.path.join(output_dir, 'enhanced_meta_model_class_accuracy.png'), 
+                dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"📈 類別準確率圖表已保存: {output_dir}/enhanced_meta_model_class_accuracy.png")
+    
+    # 保存準確率報告
+    report = {
+        'overall_accuracy': overall_accuracy,
+        'front_500_accuracy': front_acc,
+        'back_500_accuracy': back_acc,
+        'total_samples': total,
+        'correct_predictions': correct,
+        'num_classes_tested': len(class_total)
+    }
+    
+    with open(os.path.join(output_dir, 'enhanced_meta_model_results.json'), 'w') as f:
+        json.dump(report, f, indent=2)
+    
+    print(f"📋 詳細報告已保存: {output_dir}/enhanced_meta_model_results.json")
+    
+    return overall_accuracy
 
 # 評估元模型並繪製結果
 def evaluate_and_visualize(meta_model, test_predictions, test_labels, output_dir):
@@ -421,9 +1098,13 @@ def main():
     dataset = ImageFolder(args.data_dir, transform=transform, index=all_classes_index)
     
     # 分割數據集為元模型訓練集和測試集
+    # 使用固定隨機種子以確保可復現性和與溫度縮放測試使用相同的測試集
     train_size = int(args.val_split * len(dataset))
     test_size = len(dataset) - train_size
-    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+    train_dataset, test_dataset = random_split(
+        dataset, [train_size, test_size],
+        generator=torch.Generator().manual_seed(42)
+    )
     
     print(f"數據集總大小: {len(dataset)}")
     print(f"元模型訓練集大小: {len(train_dataset)}")
@@ -457,21 +1138,82 @@ def main():
     print(f"最終元模型訓練集大小: {len(train_labels)}")
     print(f"驗證集大小: {len(val_labels)}")
     
-    # 創建和訓練元模型
-    meta_model = StackingMetaModel(num_models=len(base_models)).cuda()
-    meta_model, best_val_acc = train_meta_model(
-        meta_model, train_predictions, train_labels, 
-        val_predictions, val_labels, args.epochs, args.lr
-    )
+    # 檢查是否使用置信度特徵
+    if args.use_confidence:
+        print("\n🚀 使用置信度特徵增強的Meta Model")
+        print("="*70)
+        
+        # 動態檢測Base Model的實際輸出維度
+        actual_dim = detect_model_output_dim(base_models, train_loader)
+        
+        # 重新收集帶置信度特徵的預測
+        print("重新收集帶置信度特徵的訓練集預測...")
+        train_enhanced_predictions, _ = collect_predictions_with_confidence(base_models, train_loader)
+        
+        print("重新收集帶置信度特徵的測試集預測...")
+        test_enhanced_predictions, _ = collect_predictions_with_confidence(base_models, test_loader)
+        
+        # 分割增強預測數據
+        val_enhanced_predictions = []
+        for model_data in train_enhanced_predictions:
+            val_enhanced_predictions.append({
+                'predictions': model_data['predictions'][val_idx],
+                'confidence': model_data['confidence'][val_idx],
+                'entropy': model_data['entropy'][val_idx],
+                'agreement': model_data['agreement'][val_idx]
+            })
+        
+        # 調整訓練集增強預測
+        for i, model_data in enumerate(train_enhanced_predictions):
+            train_enhanced_predictions[i] = {
+                'predictions': model_data['predictions'][train_idx],
+                'confidence': model_data['confidence'][train_idx],
+                'entropy': model_data['entropy'][train_idx],
+                'agreement': model_data['agreement'][train_idx]
+            }
+        
+        # 創建和訓練置信度增強Meta Model (使用檢測到的實際維度)
+        meta_model = StackingMetaModelWithConfidence(
+            num_models=len(base_models), 
+            num_classes=1000,
+            actual_model_output_dim=actual_dim
+        ).cuda()
+        
+        meta_model, best_val_acc = train_enhanced_meta_model(
+            meta_model, train_enhanced_predictions, train_labels,
+            val_enhanced_predictions, val_labels, args.epochs, args.lr, args.output_dir
+        )
+        
+        # 評估置信度增強模型（需要使用增強預測數據）
+        print("🔍 在測試集上評估置信度增強模型...")
+        test_acc = evaluate_enhanced_meta_model(meta_model, test_enhanced_predictions, test_labels, args.output_dir)
+        
+        # 保存置信度增強模型
+        model_save_path = os.path.join(args.output_dir, 'stacking_meta_model_with_confidence.pkl')
+        torch.save(meta_model, model_save_path)
+        print(f"置信度增強元模型已保存到: {model_save_path}")
+        
+    else:
+        print("\n📊 使用傳統Stacking方法")
+        print("="*50)
+        
+        # 創建和訓練傳統元模型
+        meta_model = StackingMetaModel(num_models=len(base_models)).cuda()
+        meta_model, best_val_acc = train_meta_model(
+            meta_model, train_predictions, train_labels, 
+            val_predictions, val_labels, args.epochs, args.lr, args.output_dir
+        )
+        
+        # 評估元模型並繪製結果
+        test_acc = evaluate_and_visualize(meta_model, test_predictions, test_labels, args.output_dir)
+        
+        # 保存傳統模型
+        model_save_path = os.path.join(args.output_dir, 'stacking_meta_model.pkl')
+        torch.save(meta_model, model_save_path)
+        print(f"元模型已保存到: {model_save_path}")
     
-    # 評估元模型並繪製結果
-    test_acc = evaluate_and_visualize(meta_model, test_predictions, test_labels, args.output_dir)
-    
-    # 保存元模型
-    torch.save(meta_model, os.path.join(args.output_dir, 'stacking_meta_model.pkl'))
-    print(f"元模型已保存到: {os.path.join(args.output_dir, 'stacking_meta_model.pkl')}")
-    print(f"最佳驗證準確率: {best_val_acc:.2f}%")
-    print(f"測試準確率: {test_acc:.2f}%")
+    print(f"🏆 最佳驗證準確率: {best_val_acc:.2f}%")
+    print(f"📊 測試準確率: {test_acc:.2f}%")
 
 if __name__ == "__main__":
     main()
